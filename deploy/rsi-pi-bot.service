@@ -1,0 +1,27 @@
+[Unit]
+Description=RSI Pi Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rsi-pi-bot
+Group=rsi-pi-bot
+
+WorkingDirectory=/opt/rsi-pi-bot
+EnvironmentFile=/etc/rsi-pi-bot.env
+
+# If you use a virtualenv created inside /opt/rsi-pi-bot/venv
+ExecStart=/opt/rsi-pi-bot/venv/bin/python -m bot.main
+
+Restart=always
+RestartSec=5
+
+# Security hardening (safe defaults; relax if you need more access)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+
+[Install]
+WantedBy=multi-user.target

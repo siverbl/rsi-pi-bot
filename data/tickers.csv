@@ -1,0 +1,99 @@
+ticker,name,tradingview_slug
+YAR.OL,Yara International ASA,OSL:YAR
+EQNR.OL,Equinor ASA,OSL:EQNR
+SALM.OL,SalMar ASA,OSL:SALM
+DNB.OL,DNB Bank ASA,OSL:DNB
+TEL.OL,Telenor ASA,OSL:TEL
+MOWI.OL,Mowi ASA,OSL:MOWI
+ORK.OL,Orkla ASA,OSL:ORK
+AKRBP.OL,Aker BP ASA,OSL:AKRBP
+NHY.OL,Norsk Hydro ASA,OSL:NHY
+SUBC.OL,Subsea 7 SA,OSL:SUBC
+STB.OL,Storebrand ASA,OSL:STB
+KOG.OL,Kongsberg Gruppen ASA,OSL:KOG
+AKER.OL,Aker ASA,OSL:AKER
+GJF.OL,Gjensidige Forsikring ASA,OSL:GJF
+TOM.OL,Tomra Systems ASA,OSL:TOM
+BAKKA.OL,Bakkafrost P/F,OSL:BAKKA
+AUSS.OL,Austevoll Seafood ASA,OSL:AUSS
+FRO.OL,Frontline Ltd,OSL:FRO
+BWO.OL,BW Offshore Ltd,OSL:BWO
+AKSO.OL,Aker Solutions ASA,OSL:AKSO
+GOGL.OL,Golden Ocean Group Ltd,OSL:GOGL
+VAR.OL,Vår Energi ASA,OSL:VAR
+HAFNI.OL,Hafnia Ltd,OSL:HAFNI
+SOFF.OL,Solstad Offshore ASA,OSL:SOFF
+PARB.OL,Pareto Bank ASA,OSL:PARB
+NOD.OL,Nordic Semiconductor ASA,OSL:NOD
+ENTRA.OL,Entra ASA,OSL:ENTRA
+FLNG.OL,Flex LNG Ltd,OSL:FLNG
+KIT.OL,Kitron ASA,OSL:KIT
+RECSI.OL,REC Silicon ASA,OSL:RECSI
+AUTO.OL,Autostore Holdings Ltd,OSL:AUTO
+KAHOT.OL,Kahoot! ASA,OSL:KAHOT
+ELMERA.OL,Elmera Group ASA,OSL:ELMERA
+MPCC.OL,MPC Container Ships ASA,OSL:MPCC
+BORR.OL,Borr Drilling Ltd,OSL:BORR
+OTL.OL,Odfjell Technology Ltd,OSL:OTL
+BWLPG.OL,BW LPG Ltd,OSL:BWLPG
+AKAST.OL,Akastor ASA,OSL:AKAST
+PROT.OL,Protector Forsikring ASA,OSL:PROT
+ZAL.OL,Zalaris ASA,OSL:ZAL
+NEL.OL,Nel ASA,OSL:NEL
+LINK.OL,Link Mobility Group Holding ASA,OSL:LINK
+ACR.OL,Axactor ASA,OSL:ACR
+NOVO-B.CO,Novo Nordisk A/S B,OMXCOP:NOVO_B
+AREC,American Resources Corporation,NASDAQ:AREC
+AEC.V,Anfield Energy Inc.,TSXV:AEC
+SB1NO.OL,SpareBank 1 Sør-Norge ASA,OSL:SB1NO
+MING.OL,SpareBank 1 SMN,OSL:MING
+NONG.OL,SpareBank 1 Nord-Norge,OSL:NONG
+SPOL.OL,SpareBank 1 Østlandet,OSL:SPOL
+SOAG.OL,SpareBank 1 Østfold Akershus,OSL:SOAG
+HELG.OL,SpareBank 1 Helgeland,OSL:HELG
+SNOR.OL,SpareBank 1 Nordmøre,OSL:SNOR
+RING.OL,SpareBank 1 Ringerike Hadeland,OSL:RING
+SBNOR.OL,Sparebanken Norge,OSL:SBNOR
+SPOG.OL,Sparebanken Øst,OSL:SPOG
+MORG.OL,Sparebanken Møre,OSL:MORG
+HGSB.OL,Haugesund Sparebank,OSL:HGSB
+AURG.OL,Aurskog Sparebank,OSL:AURG
+ROGS.OL,Rogaland Sparebank,OSL:ROGS
+JAREN.OL,Jæren Sparebank,OSL:JAREN
+BIEN.OL,Bien Sparebank ASA,OSL:BIEN
+HSPG.OL,Høland og Setskog Sparebank,OSL:HSPG
+SKUE.OL,Skue Sparebank,OSL:SKUE
+VVL.OL,Voss Veksel- og Landmandsbank,OSL:VVL
+SOGN.OL,Sogn Sparebank,OSL:SOGN
+TRSB.OL,Trøndelag Sparebank,OSL:TRSB
+AKSO.OL,Aker Solutions ASA,OSL:AKSO
+CINT.ST,Cint Group AB,OMXSTO:CINT
+PRS.OL,Prosafe,OSL:PRS
+TGS.OL,TGS,OSL:TGS
+SATS.OL,SATS,OSL:SATS
+NAPA.OL,Napatech,OSL:NAPA
+BETS-B.ST,Betsson B,OMXSTO:BETS_B
+HPQ,HP,NYSE:HPQ
+KLAR,Klarna Group,NYSE:KLAR
+MRSELL.ST,mResell,NGM:MRSELL
+MODTX.ST,Modus Therapeutics,OMXSTO:MODTX
+SIN.ST,Solution International Nordics AB,NGM:SIN
+PYPL,PayPal Holdings,NASDAQ:PYPL
+KFR.V,Kingfisher Metals,TSXV:KFR
+DVLT,Datavault AI,NASDAQ:DVLT
+FARON.HE,Faron Pharmaceuticals,OMXHEX:FARON
+FIG,Figma,NYSE:FIG
+NFLX,Netflix,NASDAQ:NFLX
+BOUV.OL,Bouvet,OSL:BOUV
+TSLA,Tesla,NASDAQ:TSLA
+SHEL.L,Shell,LSE:SHEL
+SNDK,Sandisk Corporation,NASDAQ:SNDK
+AIG,American International Group,NYSE:AIG
+BABA,Alibaba Group Holding Limited,NYSE:BABA
+INTC,Intel Corporation,NASDAQ:INTC
+PLUG,Plug Power,NASDAQ:PLUG
+NAS.OL,Norwegian Air Shuttle,OSL:NAS
+DNO.OL,DNO,OSL:DNO
+2020.OL,2020 Bulkers,OSL:2020
+SES.TO,SECURE Waste Infrastructure Corp.,TSX:SES
+MDLZ,Mondelez International,NASDAQ:MDLZ
