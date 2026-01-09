@@ -2,15 +2,21 @@
 Ticker Catalog module for RSI Discord Bot.
 Manages the instrument catalog (tickers.csv) as the single source of truth.
 """
+import asyncio
 import csv
 import logging
-from typing import Dict, Optional, List
+import os
+import tempfile
+from typing import Dict, Optional, List, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 
 from bot.config import TICKERS_FILE, TRADINGVIEW_URL_TEMPLATE
 
 logger = logging.getLogger(__name__)
+
+# Async lock for thread-safe file access
+_csv_lock = asyncio.Lock()
 
 
 @dataclass
@@ -195,3 +201,72 @@ def validate_ticker(ticker: str) -> tuple[bool, str]:
         )
     
     return True, ""
+
+
+async def remove_ticker(ticker: str) -> Tuple[bool, str, Optional[Instrument]]:
+    """
+    Remove a ticker from tickers.csv atomically.
+    
+    Args:
+        ticker: Ticker symbol to remove (case-insensitive)
+        
+    Returns:
+        Tuple of (success, message, removed_instrument)
+    """
+    ticker = ticker.upper().strip()
+    
+    async with _csv_lock:
+        catalog = get_catalog()
+        
+        # Check if ticker exists
+        instrument = catalog.get_instrument(ticker)
+        if not instrument:
+            return False, f"Ticker `{ticker}` not found in catalog", None
+        
+        try:
+            # Read all rows
+            rows = []
+            header = None
+            removed_row = None
+            
+            with open(catalog.csv_path, 'r', newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                header = reader.fieldnames
+                for row in reader:
+                    if row.get('ticker', '').strip().upper() == ticker:
+                        removed_row = row
+                    else:
+                        rows.append(row)
+            
+            if not removed_row:
+                return False, f"Ticker `{ticker}` not found in catalog file", None
+            
+            # Write to temp file atomically
+            dir_path = catalog.csv_path.parent
+            fd, temp_path = tempfile.mkstemp(suffix='.csv', dir=dir_path)
+            try:
+                with os.fdopen(fd, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=header)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                
+                # Atomic replace: rename temp file to original
+                os.replace(temp_path, catalog.csv_path)
+                
+            except Exception as e:
+                # Clean up temp file on error
+                try:
+                    os.unlink(temp_path)
+                except:
+                    pass
+                raise e
+            
+            # Reload catalog to reflect changes
+            catalog.reload()
+            
+            logger.info(f"Removed ticker from catalog: {ticker} ({instrument.name})")
+            return True, f"Successfully removed `{ticker}`", instrument
+            
+        except Exception as e:
+            logger.error(f"Error removing ticker {ticker}: {e}")
+            return False, f"Error removing ticker: {str(e)}", None

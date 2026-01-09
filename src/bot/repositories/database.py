@@ -13,7 +13,8 @@ from contextlib import asynccontextmanager
 from bot.config import (
     DEFAULT_RSI_PERIOD, DEFAULT_COOLDOWN_HOURS, DEFAULT_SCHEDULE_TIME, 
     DEFAULT_ALERT_MODE, DEFAULT_HYSTERESIS, DB_PATH,
-    DEFAULT_AUTO_OVERSOLD_THRESHOLD, DEFAULT_AUTO_OVERBOUGHT_THRESHOLD
+    DEFAULT_AUTO_OVERSOLD_THRESHOLD, DEFAULT_AUTO_OVERBOUGHT_THRESHOLD,
+    DEFAULT_SCHEDULE_ENABLED
 )
 
 
@@ -42,9 +43,11 @@ class GuildConfig:
     default_cooldown_hours: int
     alert_mode: str
     hysteresis: float
-    # NEW: Auto-scan threshold settings (admin-configurable)
+    # Auto-scan threshold settings (admin-configurable)
     auto_oversold_threshold: float = DEFAULT_AUTO_OVERSOLD_THRESHOLD
     auto_overbought_threshold: float = DEFAULT_AUTO_OVERBOUGHT_THRESHOLD
+    # NEW: Schedule toggle
+    schedule_enabled: bool = DEFAULT_SCHEDULE_ENABLED
 
 
 @dataclass
@@ -106,7 +109,7 @@ class Database:
         """Create database tables if they don't exist."""
         async with self.connect() as db:
 
-            # Guild configuration table (with new auto-scan fields)
+            # Guild configuration table (with schedule_enabled field)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS guild_config (
                     guild_id INTEGER PRIMARY KEY,
@@ -117,7 +120,8 @@ class Database:
                     alert_mode TEXT DEFAULT 'CROSSING',
                     hysteresis REAL DEFAULT 2.0,
                     auto_oversold_threshold REAL DEFAULT 34,
-                    auto_overbought_threshold REAL DEFAULT 70
+                    auto_overbought_threshold REAL DEFAULT 70,
+                    schedule_enabled INTEGER DEFAULT 1
                 )
             """)
 
@@ -153,7 +157,7 @@ class Database:
                 )
             """)
             
-            # NEW: Auto-scan daily state table (for change detection)
+            # Auto-scan daily state table (for change detection)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS auto_scan_state (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -196,8 +200,12 @@ class Database:
             except:
                 pass  # Column already exists
 
+            # NEW: Add schedule_enabled column for existing databases
+            try:
+                await db.execute("ALTER TABLE guild_config ADD COLUMN schedule_enabled INTEGER DEFAULT 1")
+            except:
+                pass  # Column already exists
 
-            
             # TradingView-only migration: normalize any existing RSI periods to 14
             # (TradingView Screener exposes RSI14 only.)
             try:
@@ -226,8 +234,10 @@ class Database:
                     return None
 
                 # aiosqlite.Row støtter "in" via keys()
-                oversold = row['auto_oversold_threshold'] if 'auto_oversold_threshold' in row.keys() else None
-                overbought = row['auto_overbought_threshold'] if 'auto_overbought_threshold' in row.keys() else None
+                keys = row.keys()
+                oversold = row['auto_oversold_threshold'] if 'auto_oversold_threshold' in keys else None
+                overbought = row['auto_overbought_threshold'] if 'auto_overbought_threshold' in keys else None
+                schedule_enabled = row['schedule_enabled'] if 'schedule_enabled' in keys else 1
 
                 return GuildConfig(
                     guild_id=row['guild_id'],
@@ -239,6 +249,7 @@ class Database:
                     hysteresis=row['hysteresis'],
                     auto_oversold_threshold=DEFAULT_AUTO_OVERSOLD_THRESHOLD if oversold is None else oversold,
                     auto_overbought_threshold=DEFAULT_AUTO_OVERBOUGHT_THRESHOLD if overbought is None else overbought,
+                    schedule_enabled=bool(schedule_enabled),
                 )
 
     async def get_or_create_guild_config(self, guild_id: int) -> GuildConfig:
@@ -251,11 +262,12 @@ class Database:
             await db.execute(
                 """INSERT INTO guild_config (guild_id, default_rsi_period, 
                    default_schedule_time, default_cooldown_hours, alert_mode, hysteresis,
-                   auto_oversold_threshold, auto_overbought_threshold)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   auto_oversold_threshold, auto_overbought_threshold, schedule_enabled)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (guild_id, DEFAULT_RSI_PERIOD, DEFAULT_SCHEDULE_TIME,
                  DEFAULT_COOLDOWN_HOURS, DEFAULT_ALERT_MODE, DEFAULT_HYSTERESIS,
-                 DEFAULT_AUTO_OVERSOLD_THRESHOLD, DEFAULT_AUTO_OVERBOUGHT_THRESHOLD)
+                 DEFAULT_AUTO_OVERSOLD_THRESHOLD, DEFAULT_AUTO_OVERBOUGHT_THRESHOLD,
+                 1 if DEFAULT_SCHEDULE_ENABLED else 0)
             )
 
             await db.commit()
@@ -269,7 +281,8 @@ class Database:
             alert_mode=DEFAULT_ALERT_MODE,
             hysteresis=DEFAULT_HYSTERESIS,
             auto_oversold_threshold=DEFAULT_AUTO_OVERSOLD_THRESHOLD,
-            auto_overbought_threshold=DEFAULT_AUTO_OVERBOUGHT_THRESHOLD
+            auto_overbought_threshold=DEFAULT_AUTO_OVERBOUGHT_THRESHOLD,
+            schedule_enabled=DEFAULT_SCHEDULE_ENABLED
         )
 
     async def update_guild_config(
@@ -282,7 +295,8 @@ class Database:
         alert_mode: Optional[str] = None,
         hysteresis: Optional[float] = None,
         auto_oversold_threshold: Optional[float] = None,
-        auto_overbought_threshold: Optional[float] = None
+        auto_overbought_threshold: Optional[float] = None,
+        schedule_enabled: Optional[bool] = None
     ) -> GuildConfig:
         """Update guild configuration with provided values."""
         # Ensure config exists
@@ -315,6 +329,9 @@ class Database:
         if auto_overbought_threshold is not None:
             updates.append("auto_overbought_threshold = ?")
             params.append(auto_overbought_threshold)
+        if schedule_enabled is not None:
+            updates.append("schedule_enabled = ?")
+            params.append(1 if schedule_enabled else 0)
 
         if updates:
             params.append(guild_id)
@@ -323,8 +340,7 @@ class Database:
                     f"UPDATE guild_config SET {', '.join(updates)} WHERE guild_id = ?",
                     params
                 )
-
-            await db.commit()
+                await db.commit()
 
         return await self.get_guild_config(guild_id)
 
@@ -568,8 +584,7 @@ class Database:
                     f"UPDATE subscription_state SET {', '.join(updates)} WHERE subscription_id = ?",
                     params
                 )
-
-            await db.commit()
+                await db.commit()
 
     async def get_subscriptions_with_state(self, guild_id: Optional[int] = None) -> List[Dict[str, Any]]:
         """Get subscriptions joined with their state."""
@@ -686,7 +701,6 @@ class Database:
                 "DELETE FROM auto_scan_state WHERE scan_date < ?",
                 (cutoff_date,)
             )
-
             await db.commit()
 
     # ==================== Helper Methods ====================

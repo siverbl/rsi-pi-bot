@@ -3,6 +3,7 @@ Scheduler module for RSI Discord Bot.
 Handles scheduled RSI checks including:
 - Daily subscription-based alerts
 - Hourly automatic scans for all tickers
+- Schedule enable/disable functionality
 """
 import logging
 from datetime import datetime, date
@@ -25,7 +26,7 @@ from bot.config import (
 )
 from bot.repositories.database import Database, AutoScanState
 from bot.services.market_data.rsi_calculator import RSICalculator
-from bot.cogs.alert_engine import AlertEngine, format_alert_list
+from bot.cogs.alert_engine import AlertEngine, Alert, format_alert_list, format_no_alerts_message
 from bot.repositories.ticker_catalog import get_catalog
 from bot.utils.message_utils import chunk_message
 
@@ -112,6 +113,7 @@ class RSIScheduler:
     Manages scheduled RSI check jobs including:
     - Daily subscription-based checks
     - Hourly automatic scans for all tickers
+    - Schedule enable/disable per guild
     """
 
     def __init__(self, bot):
@@ -269,6 +271,12 @@ class RSIScheduler:
             if not guild:
                 continue
             
+            # Check if schedule is enabled for this guild
+            config = await self.db.get_or_create_guild_config(guild_id)
+            if not config.schedule_enabled:
+                logger.info(f"Skipping auto-scan for guild {guild_id}: schedule disabled")
+                continue
+            
             await self._process_guild_autoscan(
                 guild=guild,
                 region=region,
@@ -349,7 +357,7 @@ class RSIScheduler:
         oversold_ch, overbought_ch = get_alert_channels(guild)
         changelog_ch = get_changelog_channel(guild)
         
-        # Post to alert channels if needed
+        # Post to alert channels if needed (with suppress_embeds=True)
         if post_oversold and oversold_ch and can_send_to_channel(oversold_ch, guild.me):
             await self._post_autoscan_alerts(
                 channel=oversold_ch,
@@ -412,7 +420,7 @@ class RSIScheduler:
         data_timestamp: Optional[datetime],
         region: str
     ):
-        """Post auto-scan alerts to a channel."""
+        """Post auto-scan alerts to a channel with suppressed embeds."""
         if condition == 'UNDER':
             header = f"📉 **RSI Auto-Scan: Oversold ({region.replace('_', '/').title()})**\n"
             header += f"Threshold: RSI < {threshold}\n"
@@ -436,7 +444,8 @@ class RSIScheduler:
             url = instrument.tradingview_url if instrument else ""
             
             if url:
-                line = f"{i}) **{ticker}** — [{name}]({url}) — RSI14: **{rsi_val:.1f}**"
+                # Wrap URL in angle brackets to suppress embed preview
+                line = f"{i}) **{ticker}** — [{name}](<{url}>) — RSI14: **{rsi_val:.1f}**"
             else:
                 line = f"{i}) **{ticker}** — {name} — RSI14: **{rsi_val:.1f}**"
             lines.append(line)
@@ -447,7 +456,8 @@ class RSIScheduler:
         
         for msg in messages:
             try:
-                await channel.send(msg)
+                # Suppress embeds to prevent TradingView link previews
+                await channel.send(msg, suppress_embeds=True)
             except discord.HTTPException as e:
                 logger.error(f"Failed to send auto-scan alert: {e}")
 
@@ -503,11 +513,26 @@ class RSIScheduler:
         logger.info(f"Starting daily RSI check at {start_time.isoformat()}")
 
         try:
-            # Step 1: Load all active subscriptions
+            # Get guild IDs to check schedule_enabled
+            guild_ids = await self.db.get_all_guild_ids()
+            enabled_guilds = []
+            for guild_id in guild_ids:
+                config = await self.db.get_or_create_guild_config(guild_id)
+                if config.schedule_enabled:
+                    enabled_guilds.append(guild_id)
+                else:
+                    logger.info(f"Skipping daily check for guild {guild_id}: schedule disabled")
+            
+            if not enabled_guilds:
+                logger.info("No guilds with schedule enabled, skipping daily check")
+                return
+
+            # Step 1: Load all active subscriptions (only for enabled guilds)
             subscriptions_data = await self.db.get_subscriptions_with_state()
+            subscriptions_data = [s for s in subscriptions_data if s['guild_id'] in enabled_guilds]
 
             if not subscriptions_data:
-                logger.info("No active subscriptions found")
+                logger.info("No active subscriptions found for enabled guilds")
                 return
 
             logger.info(f"Found {len(subscriptions_data)} active subscriptions")
@@ -590,13 +615,13 @@ class RSIScheduler:
 
                 guild_alerts = alerts_by_guild.get(guild_id, {'UNDER': [], 'OVER': []})
 
-                # Send UNDER alerts to oversold channel
+                # Send UNDER alerts to oversold channel (suppress embeds)
                 if oversold_ch and can_send_to_channel(oversold_ch, guild.me):
                     try:
                         if guild_alerts['UNDER']:
                             messages = format_alert_list(guild_alerts['UNDER'], 'UNDER')
                             for msg in messages:
-                                await oversold_ch.send(msg)
+                                await oversold_ch.send(msg, suppress_embeds=True)
                                 sent_count += 1
                     except discord.Forbidden:
                         logger.error(f"Permission denied sending to #{OVERSOLD_CHANNEL_NAME} in guild {guild_id}")
@@ -605,13 +630,13 @@ class RSIScheduler:
                         logger.error(f"Error sending to #{OVERSOLD_CHANNEL_NAME} in guild {guild_id}: {e}")
                         error_count += 1
 
-                # Send OVER alerts to overbought channel
+                # Send OVER alerts to overbought channel (suppress embeds)
                 if overbought_ch and can_send_to_channel(overbought_ch, guild.me):
                     try:
                         if guild_alerts['OVER']:
                             messages = format_alert_list(guild_alerts['OVER'], 'OVER')
                             for msg in messages:
-                                await overbought_ch.send(msg)
+                                await overbought_ch.send(msg, suppress_embeds=True)
                                 sent_count += 1
                     except discord.Forbidden:
                         logger.error(f"Permission denied sending to #{OVERBOUGHT_CHANNEL_NAME} in guild {guild_id}")

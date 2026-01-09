@@ -44,7 +44,7 @@ def chunk_message(
                 current_chunk = continuation_prefix
             
             # If single line is too long, force split it
-            if len(line_with_sep) > max_length:
+            if len(line_with_sep) > max_length - len(continuation_prefix):
                 # Split the long line into smaller pieces
                 remaining = line
                 while len(remaining) > max_length - len(continuation_prefix):

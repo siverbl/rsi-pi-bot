@@ -80,6 +80,7 @@ DEFAULT_AUTO_OVERBOUGHT_THRESHOLD = 70
 # =============================================================================
 DEFAULT_TIMEZONE = "Europe/Oslo"
 DEFAULT_SCHEDULE_TIME = "18:30"
+DEFAULT_SCHEDULE_ENABLED = True  # NEW: Default for schedule toggle
 
 # Market Hours (Europe/Oslo timezone)
 # Norway/Europe market hours: 09:30 - 17:30

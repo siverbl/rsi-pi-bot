@@ -322,10 +322,10 @@ def format_single_alert(alert: Alert, index: int) -> str:
     else:
         persistence = f"⏱️ **day {alert.days_in_zone}**"
     
-    # Format the line
+    # Format the line (wrap URL in angle brackets to suppress embed preview)
     line = (
         f"{index}) **{alert.ticker}** — "
-        f"[{alert.name}]({alert.tradingview_url}) — "
+        f"[{alert.name}](<{alert.tradingview_url}>) — "
         f"RSI{alert.period}: **{alert.rsi_value:.1f}** | "
         f"Rule: **{rule_symbol} {alert.threshold}** | "
         f"{persistence}"

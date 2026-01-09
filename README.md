@@ -15,9 +15,10 @@ A Discord bot that monitors stock RSI (Relative Strength Index) levels and sends
 - **Persistent Storage**: SQLite database survives bot restarts
 - **Cooldown System**: Prevents alert spam with configurable cooldown periods
 - **Batch Processing**: Efficiently handles 300-500 tickers with batched API calls
-- **TradingView Links**: Alert messages include clickable TradingView chart links
+- **TradingView Links**: Alert messages include clickable TradingView chart links (embed-free)
 - **Auto-Add Tickers**: Request new tickers in `#request` - bot auto-derives exchange codes
 - **Message Chunking**: Automatically splits long messages to stay under Discord's 2000-character limit
+- **Schedule Toggle**: Enable/disable automatic scheduled scans per server
 
 ## Quick Start
 
@@ -26,9 +27,11 @@ A Discord bot that monitors stock RSI (Relative Strength Index) levels and sends
 - Python 3.11+ (recommended for Raspberry Pi OS 64-bit)
 - A Discord Bot Token ([Create one here](https://discord.com/developers/applications))
 - `tickers.csv` file with your stock list
-- **Two channels in your Discord server:**
+- **Channels in your Discord server:**
   - `#rsi-oversold` — for UNDER alerts (oversold signals)
   - `#rsi-overbought` — for OVER alerts (overbought signals)
+  - `#request` — for ticker add requests
+  - `#server-changelog` — for admin logs and server status
 
 ### 2. Installation
 
@@ -94,9 +97,10 @@ journalctl -u rsi-pi-bot.service -f --no-pager
 | `/unsubscribe` | Remove your own subscription by ID | None |
 | `/unsubscribe-all` | Remove all your subscriptions | None |
 | `/admin-unsubscribe` | Remove any subscription (logged) | Administrator |
+| `/remove-ticker` | Remove a ticker from the catalog | Administrator |
 | `/list` | List all subscriptions (with optional ticker filter) | None |
-| `/run-now` | Manually trigger RSI check | Manage Server |
-| `/set-defaults` | Configure server defaults | Manage Server |
+| `/run-now` | Manually trigger full RSI check | Manage Server |
+| `/set-defaults` | Configure server defaults (including schedule toggle) | Manage Server |
 | `/ticker-info` | Look up a ticker (shows RSI, subscriptions) | None |
 | `/catalog-stats` | Show catalog and subscription statistics | None |
 | `/reload-catalog` | Reload tickers.csv | Administrator |
@@ -144,20 +148,105 @@ journalctl -u rsi-pi-bot.service -f --no-pager
 /catalog-stats
 ```
 
+**Remove a ticker from the catalog (Admin):**
+```
+/remove-ticker ticker:EQNR.OL
+```
+
+**Disable scheduled scans:**
+```
+/set-defaults schedule_enabled:Disabled
+```
+
+**Re-enable scheduled scans:**
+```
+/set-defaults schedule_enabled:Enabled
+```
+
+## Admin Commands
+
+### `/remove-ticker`
+
+**Purpose:** Remove a ticker from `tickers.csv` catalog.
+
+**Permissions:** Administrator only
+
+**Behavior:**
+- Case-insensitive ticker matching
+- Atomic CSV write (temp file + replace) to prevent corruption
+- Shows removed ticker details (ticker, name, TradingView slug)
+- Logs removal to `#server-changelog`
+- Reloads catalog automatically after removal
+
+**Example:**
+```
+/remove-ticker ticker:EQNR.OL
+```
+
+Response:
+```
+✅ Ticker removed: EQNR.OL
+Name: Equinor ASA
+TradingView: OSL:EQNR
+```
+
+### `/run-now`
+
+**Purpose:** Manually trigger a complete RSI check.
+
+**Permissions:** Manage Server
+
+**Behavior:**
+1. Scans **all tickers** in the catalog (not just subscriptions)
+2. Posts auto-scan results to `#rsi-oversold` (sorted RSI ascending) and `#rsi-overbought` (sorted RSI descending)
+3. Evaluates user subscriptions separately
+4. Posts subscription alerts with "🔔 Subscription Alerts" label if triggered
+5. Logs comprehensive summary to `#server-changelog` including:
+   - Who triggered it
+   - Scan statistics (batches, success/fail counts)
+   - Data timestamp
+   - Alert counts
+
+### `/set-defaults`
+
+**Purpose:** Configure server-level defaults and schedule settings.
+
+**Permissions:** Manage Server
+
+**Parameters:**
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `default_period` | RSI period (must be 14) | 14 |
+| `default_cooldown` | Hours between alerts | 24 |
+| `schedule_time` | Daily check time (HH:MM, Europe/Oslo) | 18:30 |
+| `alert_mode` | CROSSING or LEVEL | CROSSING |
+| `hysteresis` | Buffer for threshold bouncing | 2.0 |
+| `auto_oversold` | Auto-scan oversold threshold | 34 |
+| `auto_overbought` | Auto-scan overbought threshold | 70 |
+| `schedule_enabled` | Enable/disable scheduled scans | Enabled |
+
+**Schedule Toggle Behavior:**
+- When `schedule_enabled = Disabled`, hourly and daily scheduled scans stop
+- When `schedule_enabled = Enabled`, scheduling resumes immediately
+- Changes persist across bot restarts
+- Changes are logged to `#server-changelog`
+
+
 ## Alert Channels
 
-The bot uses **two fixed channels** for alerts (no channel selection needed):
+The bot uses **fixed channels** for alerts (no channel selection needed):
 
 | Channel | Alert Type | Sorting |
 |---------|------------|---------|
 | `#rsi-oversold` | UNDER alerts | Lowest RSI first |
 | `#rsi-overbought` | OVER alerts | Highest RSI first |
+| `#server-changelog` | Admin logs, scan status | Chronological |
 
 **Important:** Create these channels before using the bot. The bot will show an error if they don't exist.
 
 ## Alert Message Format
 
-Alerts use a numbered list format with clickable TradingView chart links:
+Alerts use a numbered list format with clickable TradingView chart links (no embeds):
 
 ```
 📈 **RSI Overbought Alerts**
@@ -168,12 +257,13 @@ Alerts use a numbered list format with clickable TradingView chart links:
 
 - **🆕 just crossed** — First day the condition is met
 - **⏱️ day N** — Consecutive trading days the condition has been met
+- Links are clickable but **no preview embeds** are shown
 
 ## Configuration
 
 ### Automatic Hourly Scans
 
-The bot automatically scans all tickers in the catalog during market hours:
+The bot automatically scans all tickers in the catalog during market hours (when `schedule_enabled = true`):
 
 - **European markets**: 09:30 - 17:30 Europe/Oslo (hourly at :30)
 - **US/Canada markets**: 15:30 - 22:30 Europe/Oslo (hourly at :30)
@@ -192,7 +282,7 @@ Admins can configure auto-scan thresholds per server using `/set-defaults`:
 - **auto_oversold**: Oversold threshold for auto-scans (default: 34)
 - **auto_overbought**: Overbought threshold for auto-scans (default: 70)
 
-These are separate from user subscription thresholds and apply only to the hourly automatic scans.
+These are separate from user subscription thresholds and apply only to the automatic scans.
 
 ### tickers.csv
 
@@ -209,12 +299,6 @@ AAPL,Apple Inc.,NASDAQ:AAPL
 - `name`: Company display name for alerts
 - `tradingview_slug`: TradingView symbol (EXCHANGE:SYMBOL format) for chart links
 
-### Ticker Format Limits
-
-**There are no artificial limits** on ticker symbol format beyond:
-- Must exist in `tickers.csv` (the instrument catalog)
-- Must include a valid `tradingview_slug` (format: `EXCHANGE:SYMBOL`)
-
 ### Server Defaults
 
 Admins can configure server defaults with `/set-defaults`:
@@ -226,6 +310,7 @@ Admins can configure server defaults with `/set-defaults`:
 - **hysteresis**: Buffer to prevent threshold bouncing (default: 2.0)
 - **auto_oversold**: Auto-scan oversold threshold (default: 34)
 - **auto_overbought**: Auto-scan overbought threshold (default: 70)
+- **schedule_enabled**: Enable/disable scheduled scans (default: Enabled)
 
 ## Alert System
 
@@ -253,10 +338,13 @@ The bot tracks **consecutive trading days** that a stock meets the condition:
 
 ## Database Schema
 
-The bot uses SQLite with three tables:
+The bot uses SQLite with the following tables:
 
 ### guild_config
-Server-level settings including defaults for RSI period, cooldown, schedule time, and alert mode.
+Server-level settings including:
+- defaults for RSI period, cooldown, schedule time, alert mode
+- auto-scan thresholds (oversold, overbought)
+- **schedule_enabled** (boolean) - controls whether scheduled scans run
 
 ### subscriptions
 Each alert rule with ticker, condition (UNDER/OVER), threshold, period, cooldown, and `created_by_user_id`.
@@ -264,41 +352,41 @@ Each alert rule with ticker, condition (UNDER/OVER), threshold, period, cooldown
 ### subscription_state
 Tracks last RSI value, crossing status, cooldown, and consecutive days in zone for each subscription.
 
+### auto_scan_state
+Tracks daily auto-scan state per guild/condition for change detection.
+
 ## File Structure
 
 ```
 rsi-pi-bot/
-├── main.py              # Main entry point with slash commands
-├── config.py            # Configuration settings
-├── database.py          # SQLite database operations
-├── rsi_calculator.py    # RSI calculation logic
-├── ticker_catalog.py    # Ticker catalog management
-├── alert_engine.py      # Alert trigger logic and formatting
-├── scheduler.py         # Scheduled job handling
-├── ticker_request.py    # Auto-add tickers from #request channel
-├── server_monitor.py    # Server health monitoring and control
-├── tickers.csv          # Instrument catalog
-├── requirements.txt     # Python dependencies
-├── rsi_bot.db          # SQLite database (created on first run)
-├── rsi_bot.log         # Log file
-└── refdata/            # Exchange lookup reference data
-    ├── exchange_code_yahoo_suffix.csv  # Yahoo suffix → exchange mapping
-    ├── nasdaqlisted.txt                # NASDAQ symbols
-    └── otherlisted.txt                 # Other US exchange symbols
+├── src/bot/
+│   ├── main.py              # Main entry point with slash commands
+│   ├── config.py            # Configuration settings
+│   ├── repositories/
+│   │   ├── database.py      # SQLite database operations
+│   │   └── ticker_catalog.py # Ticker catalog management (including remove_ticker)
+│   ├── services/
+│   │   ├── scheduler.py     # Scheduled job handling (with schedule_enabled checks)
+│   │   └── market_data/
+│   │       ├── rsi_calculator.py    # RSI calculation logic
+│   │       └── providers/
+│   │           └── tradingview_provider.py  # TradingView data provider
+│   ├── cogs/
+│   │   ├── alert_engine.py  # Alert trigger logic and formatting
+│   │   └── ticker_request.py # Auto-add tickers from #request channel
+│   └── utils/
+│       └── message_utils.py # Message chunking utilities
+├── data/
+│   ├── tickers.csv          # Instrument catalog
+│   └── refdata/             # Exchange lookup reference data
+├── deploy/
+│   ├── rsi-pi-bot.env.example
+│   └── rsi-pi-bot.service
+├── tests/
+│   └── test_ticker_removal.py
+├── requirements.txt
+└── README.md
 ```
-
-### tickers.csv Format
-
-```csv
-ticker,name,tradingview_slug
-YAR.OL,Yara International ASA,OSL:YAR
-EQNR.OL,Equinor ASA,OSL:EQNR
-AAPL,Apple Inc.,NASDAQ:AAPL
-```
-
-- `ticker`: Yahoo Finance ticker (used for data fetching)
-- `name`: Company display name
-- `tradingview_slug`: `EXCHANGE:SYMBOL` format for TradingView chart links
 
 ## Auto-Add Tickers (#request channel)
 
@@ -316,43 +404,16 @@ The bot will:
 4. Add to `tickers.csv` if not already present
 5. Reply with confirmation including the TradingView link
 
-**No manual exchange selection needed!** The bot uses reference data files in `refdata/` to automatically map:
+**No manual exchange selection needed!** The bot uses reference data files in `data/refdata/` to automatically map:
 - Yahoo suffixes (`.OL`, `.ST`, `.TO`, etc.) to exchange codes
 - US stocks (no suffix) to NASDAQ, NYSE, etc.
-
-### Reference Data Files
-
-Located in `refdata/`:
-- `exchange_code_yahoo_suffix.csv` - Maps Yahoo suffixes to TradingView exchange codes
-- `nasdaqlisted.txt` - NASDAQ-listed US symbols
-- `otherlisted.txt` - Other US exchange symbols (NYSE, AMEX, etc.)
 
 ## Subscription Ownership
 
 - Users can only remove their **own** subscriptions with `/unsubscribe`
 - Admins can remove any subscription with `/admin-unsubscribe`
+- Admins can remove tickers from catalog with `/remove-ticker`
 - Admin actions are logged to `#server-changelog`
-
-## Server Monitoring
-
-Optional server health monitoring and control features.
-
-### Environment Variables
-
-```bash
-# Health check endpoint (enables monitoring)
-SERVER_HEALTH_URL=http://localhost:8080/health
-
-# Server control scripts (admin commands)
-SERVER_RESTART_SCRIPT=/opt/scripts/restart_server.sh
-SERVER_SHUTDOWN_SCRIPT=/opt/scripts/shutdown_server.sh
-```
-
-### Features
-
-- Automatic status announcements when server goes online/offline
-- Scheduled restart/shutdown with warnings (10 min, 1 min before)
-- All actions logged to `#server-changelog`
 
 ## Discord Bot Setup
 
@@ -374,16 +435,18 @@ SERVER_SHUTDOWN_SCRIPT=/opt/scripts/shutdown_server.sh
 
 ## Scheduling
 
-The bot runs a daily RSI check at a configurable time (default 18:30 Europe/Oslo timezone). This is after European markets close, ensuring the day's data is complete.
+The bot runs scheduled RSI checks based on `schedule_enabled` setting:
 
-The job:
-1. Loads all active subscriptions
-2. Determines required tickers and RSI periods
-3. Fetches price data in batches (100 tickers per batch)
-4. Calculates RSI for each ticker/period combination
-5. Evaluates crossing conditions
-6. Sends sorted alerts to the fixed channels
-7. Updates state for next run
+**When enabled:**
+- Hourly scans during market hours (European: 09:30-17:30, US/Canada: 15:30-22:30)
+- Daily subscription check at configured time (default 18:30 Europe/Oslo)
+
+**When disabled:**
+- No automatic scans run
+- Manual `/run-now` still works
+- Status shown in `/catalog-stats`
+
+Changes take effect immediately without restart.
 
 ## Troubleshooting
 
@@ -395,6 +458,7 @@ The job:
 - Check `/list` to verify subscriptions exist
 - Use `/run-now` to trigger a check manually
 - Verify ticker exists in `tickers.csv`
+- Check if `schedule_enabled` is disabled (use `/set-defaults`)
 
 ### "Channel not found" error
 - Ensure `#rsi-oversold` and `#rsi-overbought` channels exist
@@ -404,12 +468,18 @@ The job:
 - Ensure ticker format matches Yahoo Finance (e.g., `EQNR.OL`)
 - Check logs for data fetch errors
 
+### Scheduled scans not running
+- Check `/catalog-stats` for schedule status
+- Use `/set-defaults schedule_enabled:Enabled` to re-enable
+
 ## Logs
 
-The bot logs to both console and `rsi_bot.log`. Check logs for:
+The bot logs to both console and `runtime/rsi_bot.log`. Check logs for:
 - Startup status
 - Data fetch success/failures
 - Alert triggers
+- Schedule enable/disable changes
+- Ticker removals
 - Errors
 
 ## License
