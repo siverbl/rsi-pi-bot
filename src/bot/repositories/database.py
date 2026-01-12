@@ -1,14 +1,23 @@
 """
 Database module for RSI Discord Bot.
-Uses SQLite for persistent storage of subscriptions, state, and auto-scan settings.
+Uses SQLite for persistent storage of subscriptions, state, RSI values, and auto-scan settings.
+
+Key tables:
+- guild_config: Per-guild configuration (thresholds, schedule enabled, etc.)
+- subscriptions: User-created alert subscriptions
+- subscription_state: State tracking for subscriptions (crossing detection, cooldown)
+- auto_scan_state: Daily state for change detection in auto-scans
+- ticker_rsi: Persistent RSI storage for all tickers (spec section 4)
 """
 import aiosqlite
-from datetime import datetime, date
-from typing import Optional, List, Dict, Any, Set
+import json
+from datetime import datetime, date, timedelta
+from typing import Optional, List, Dict, Any, Set, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from contextlib import asynccontextmanager
+import logging
 
 from bot.config import (
     DEFAULT_RSI_PERIOD, DEFAULT_COOLDOWN_HOURS, DEFAULT_SCHEDULE_TIME, 
@@ -16,6 +25,8 @@ from bot.config import (
     DEFAULT_AUTO_OVERSOLD_THRESHOLD, DEFAULT_AUTO_OVERBOUGHT_THRESHOLD,
     DEFAULT_SCHEDULE_ENABLED
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Condition(Enum):
@@ -43,10 +54,8 @@ class GuildConfig:
     default_cooldown_hours: int
     alert_mode: str
     hysteresis: float
-    # Auto-scan threshold settings (admin-configurable)
     auto_oversold_threshold: float = DEFAULT_AUTO_OVERSOLD_THRESHOLD
     auto_overbought_threshold: float = DEFAULT_AUTO_OVERBOUGHT_THRESHOLD
-    # NEW: Schedule toggle
     schedule_enabled: bool = DEFAULT_SCHEDULE_ENABLED
 
 
@@ -74,18 +83,30 @@ class SubscriptionState:
     last_date: Optional[str]
     last_status: str
     last_alert_at: Optional[datetime]
-    days_in_zone: int  # consecutive days under/over threshold
+    days_in_zone: int
 
 
 @dataclass
 class AutoScanState:
-    """Tracks the daily state of automatic RSI scans."""
+    """Tracks the daily state of automatic RSI scans for change detection."""
     guild_id: int
     scan_date: str  # YYYY-MM-DD format
     condition: str  # "UNDER" or "OVER"
-    last_tickers: Set[str] = field(default_factory=set)  # Tickers that met condition
+    last_tickers: Set[str] = field(default_factory=set)
     last_scan_time: Optional[datetime] = None
-    post_count: int = 0  # Number of times posted today
+    post_count: int = 0
+
+
+@dataclass
+class TickerRSI:
+    """Persistent RSI storage for a ticker (spec section 4)."""
+    ticker: str
+    tradingview_slug: Optional[str]
+    rsi_14: float
+    last_close: Optional[float]
+    data_date: str  # Date of the RSI data (YYYY-MM-DD)
+    data_timestamp: Optional[datetime]  # When data was fetched
+    updated_at: datetime
 
 
 class Database:
@@ -109,7 +130,7 @@ class Database:
         """Create database tables if they don't exist."""
         async with self.connect() as db:
 
-            # Guild configuration table (with schedule_enabled field)
+            # Guild configuration table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS guild_config (
                     guild_id INTEGER PRIMARY KEY,
@@ -170,8 +191,22 @@ class Database:
                     UNIQUE(guild_id, scan_date, condition)
                 )
             """)
+            
+            # NEW: Ticker RSI persistence table (spec section 4)
+            # Stores RSI values for ALL tickers evaluated during scans
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS ticker_rsi (
+                    ticker TEXT PRIMARY KEY,
+                    tradingview_slug TEXT,
+                    rsi_14 REAL NOT NULL,
+                    last_close REAL,
+                    data_date TEXT NOT NULL,
+                    data_timestamp TEXT,
+                    updated_at TEXT NOT NULL
+                )
+            """)
 
-            # Create indexes for faster queries
+            # Create indexes
             await db.execute("""
                 CREATE INDEX IF NOT EXISTS idx_subscriptions_guild 
                 ON subscriptions(guild_id)
@@ -188,26 +223,24 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_auto_scan_state_guild_date 
                 ON auto_scan_state(guild_id, scan_date)
             """)
+            await db.execute("""
+                CREATE INDEX IF NOT EXISTS idx_ticker_rsi_updated
+                ON ticker_rsi(updated_at)
+            """)
             
-            # Add new columns if they don't exist (migration for existing databases)
-            try:
-                await db.execute("ALTER TABLE guild_config ADD COLUMN auto_oversold_threshold REAL DEFAULT 34")
-            except:
-                pass  # Column already exists
-            
-            try:
-                await db.execute("ALTER TABLE guild_config ADD COLUMN auto_overbought_threshold REAL DEFAULT 70")
-            except:
-                pass  # Column already exists
+            # Migrations for existing databases
+            migrations = [
+                "ALTER TABLE guild_config ADD COLUMN auto_oversold_threshold REAL DEFAULT 34",
+                "ALTER TABLE guild_config ADD COLUMN auto_overbought_threshold REAL DEFAULT 70",
+                "ALTER TABLE guild_config ADD COLUMN schedule_enabled INTEGER DEFAULT 1",
+            ]
+            for migration in migrations:
+                try:
+                    await db.execute(migration)
+                except Exception:
+                    pass  # Column already exists
 
-            # NEW: Add schedule_enabled column for existing databases
-            try:
-                await db.execute("ALTER TABLE guild_config ADD COLUMN schedule_enabled INTEGER DEFAULT 1")
-            except:
-                pass  # Column already exists
-
-            # TradingView-only migration: normalize any existing RSI periods to 14
-            # (TradingView Screener exposes RSI14 only.)
+            # TradingView-only: normalize RSI periods to 14
             try:
                 await db.execute("UPDATE guild_config SET default_rsi_period = 14 WHERE default_rsi_period IS NULL OR default_rsi_period != 14")
             except Exception:
@@ -218,6 +251,7 @@ class Database:
                 pass
 
             await db.commit()
+            logger.info("Database initialized successfully")
 
     # ==================== Guild Config Operations ====================
 
@@ -233,7 +267,6 @@ class Database:
                 if not row:
                     return None
 
-                # aiosqlite.Row støtter "in" via keys()
                 keys = row.keys()
                 oversold = row['auto_oversold_threshold'] if 'auto_oversold_threshold' in keys else None
                 overbought = row['auto_overbought_threshold'] if 'auto_overbought_threshold' in keys else None
@@ -269,7 +302,6 @@ class Database:
                  DEFAULT_AUTO_OVERSOLD_THRESHOLD, DEFAULT_AUTO_OVERBOUGHT_THRESHOLD,
                  1 if DEFAULT_SCHEDULE_ENABLED else 0)
             )
-
             await db.commit()
 
         return GuildConfig(
@@ -299,7 +331,6 @@ class Database:
         schedule_enabled: Optional[bool] = None
     ) -> GuildConfig:
         """Update guild configuration with provided values."""
-        # Ensure config exists
         await self.get_or_create_guild_config(guild_id)
 
         updates = []
@@ -455,7 +486,6 @@ class Database:
                 "DELETE FROM subscriptions WHERE id = ? AND guild_id = ?",
                 (subscription_id, guild_id)
             )
-
             await db.commit()
             return cursor.rowcount > 0
 
@@ -480,7 +510,6 @@ class Database:
     async def delete_user_subscriptions(self, guild_id: int, user_id: int) -> int:
         """Delete all subscriptions created by a specific user in a guild."""
         async with self.connect() as db:
-            # First get the IDs to delete state records
             async with db.execute(
                 """SELECT id FROM subscriptions 
                    WHERE guild_id = ? AND created_by_user_id = ?""",
@@ -492,19 +521,16 @@ class Database:
             if not sub_ids:
                 return 0
             
-            # Delete state records
             placeholders = ','.join('?' * len(sub_ids))
             await db.execute(
                 f"DELETE FROM subscription_state WHERE subscription_id IN ({placeholders})",
                 sub_ids
             )
             
-            # Delete subscriptions
             cursor = await db.execute(
                 "DELETE FROM subscriptions WHERE guild_id = ? AND created_by_user_id = ?",
                 (guild_id, user_id)
             )
-
             await db.commit()
             return cursor.rowcount
 
@@ -616,7 +642,6 @@ class Database:
         condition: str
     ) -> Optional[AutoScanState]:
         """Get the auto-scan state for a guild/date/condition."""
-        import json
         async with self.connect() as db:
             db.row_factory = aiosqlite.Row
             async with db.execute(
@@ -632,7 +657,7 @@ class Database:
                     if row['last_scan_time']:
                         try:
                             last_scan_time = datetime.fromisoformat(row['last_scan_time'])
-                        except:
+                        except Exception:
                             pass
                     return AutoScanState(
                         guild_id=row['guild_id'],
@@ -653,16 +678,13 @@ class Database:
         increment_post_count: bool = False
     ) -> AutoScanState:
         """Update or create auto-scan state."""
-        import json
         tickers_json = json.dumps(sorted(list(tickers)))
         now = datetime.utcnow().isoformat()
         
         async with self.connect() as db:
-            # Try to get existing state
             existing = await self.get_auto_scan_state(guild_id, scan_date, condition)
             
             if existing:
-                # Update existing
                 if increment_post_count:
                     await db.execute(
                         """UPDATE auto_scan_state 
@@ -678,7 +700,6 @@ class Database:
                         (tickers_json, now, guild_id, scan_date, condition)
                     )
             else:
-                # Insert new
                 post_count = 1 if increment_post_count else 0
                 await db.execute(
                     """INSERT INTO auto_scan_state 
@@ -686,14 +707,12 @@ class Database:
                        VALUES (?, ?, ?, ?, ?, ?)""",
                     (guild_id, scan_date, condition, tickers_json, now, post_count)
                 )
-
             await db.commit()
         
         return await self.get_auto_scan_state(guild_id, scan_date, condition)
     
     async def cleanup_old_auto_scan_states(self, days_to_keep: int = 7):
         """Clean up old auto-scan state records."""
-        from datetime import timedelta
         cutoff_date = (datetime.utcnow() - timedelta(days=days_to_keep)).strftime("%Y-%m-%d")
         
         async with self.connect() as db:
@@ -702,6 +721,171 @@ class Database:
                 (cutoff_date,)
             )
             await db.commit()
+
+    # ==================== Ticker RSI Persistence (Spec Section 4) ====================
+    
+    async def upsert_ticker_rsi(
+        self,
+        ticker: str,
+        rsi_14: float,
+        data_date: str,
+        tradingview_slug: Optional[str] = None,
+        last_close: Optional[float] = None,
+        data_timestamp: Optional[datetime] = None
+    ) -> TickerRSI:
+        """
+        Insert or update RSI value for a ticker.
+        This stores RSI values for ALL evaluated tickers (catalog + subscriptions).
+        """
+        now = datetime.utcnow()
+        data_ts_str = data_timestamp.isoformat() if data_timestamp else None
+        
+        async with self.connect() as db:
+            await db.execute(
+                """INSERT INTO ticker_rsi 
+                   (ticker, tradingview_slug, rsi_14, last_close, data_date, data_timestamp, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(ticker) DO UPDATE SET
+                       tradingview_slug = COALESCE(excluded.tradingview_slug, ticker_rsi.tradingview_slug),
+                       rsi_14 = excluded.rsi_14,
+                       last_close = excluded.last_close,
+                       data_date = excluded.data_date,
+                       data_timestamp = excluded.data_timestamp,
+                       updated_at = excluded.updated_at
+                """,
+                (ticker.upper(), tradingview_slug, rsi_14, last_close, data_date, data_ts_str, now.isoformat())
+            )
+            await db.commit()
+        
+        return TickerRSI(
+            ticker=ticker.upper(),
+            tradingview_slug=tradingview_slug,
+            rsi_14=rsi_14,
+            last_close=last_close,
+            data_date=data_date,
+            data_timestamp=data_timestamp,
+            updated_at=now
+        )
+    
+    async def upsert_ticker_rsi_batch(
+        self,
+        rsi_data: List[Dict[str, Any]]
+    ) -> int:
+        """
+        Batch insert/update RSI values for multiple tickers.
+        
+        Args:
+            rsi_data: List of dicts with keys: ticker, rsi_14, data_date, 
+                      and optional: tradingview_slug, last_close, data_timestamp
+        
+        Returns:
+            Number of tickers updated
+        """
+        if not rsi_data:
+            return 0
+        
+        now = datetime.utcnow().isoformat()
+        count = 0
+        
+        async with self.connect() as db:
+            for item in rsi_data:
+                data_ts = item.get('data_timestamp')
+                data_ts_str = data_ts.isoformat() if isinstance(data_ts, datetime) else data_ts
+                
+                await db.execute(
+                    """INSERT INTO ticker_rsi 
+                       (ticker, tradingview_slug, rsi_14, last_close, data_date, data_timestamp, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(ticker) DO UPDATE SET
+                           tradingview_slug = COALESCE(excluded.tradingview_slug, ticker_rsi.tradingview_slug),
+                           rsi_14 = excluded.rsi_14,
+                           last_close = excluded.last_close,
+                           data_date = excluded.data_date,
+                           data_timestamp = excluded.data_timestamp,
+                           updated_at = excluded.updated_at
+                    """,
+                    (
+                        item['ticker'].upper(),
+                        item.get('tradingview_slug'),
+                        item['rsi_14'],
+                        item.get('last_close'),
+                        item['data_date'],
+                        data_ts_str,
+                        now
+                    )
+                )
+                count += 1
+            
+            await db.commit()
+        
+        logger.debug(f"Batch upserted {count} ticker RSI records")
+        return count
+    
+    async def get_ticker_rsi(self, ticker: str) -> Optional[TickerRSI]:
+        """Get stored RSI data for a ticker."""
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM ticker_rsi WHERE ticker = ?",
+                (ticker.upper(),)
+            ) as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    data_timestamp = None
+                    if row['data_timestamp']:
+                        try:
+                            data_timestamp = datetime.fromisoformat(row['data_timestamp'])
+                        except Exception:
+                            pass
+                    
+                    return TickerRSI(
+                        ticker=row['ticker'],
+                        tradingview_slug=row['tradingview_slug'],
+                        rsi_14=row['rsi_14'],
+                        last_close=row['last_close'],
+                        data_date=row['data_date'],
+                        data_timestamp=data_timestamp,
+                        updated_at=datetime.fromisoformat(row['updated_at'])
+                    )
+                return None
+    
+    async def get_all_ticker_rsi(self) -> List[TickerRSI]:
+        """Get all stored ticker RSI values."""
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM ticker_rsi ORDER BY ticker") as cursor:
+                rows = await cursor.fetchall()
+                results = []
+                for row in rows:
+                    data_timestamp = None
+                    if row['data_timestamp']:
+                        try:
+                            data_timestamp = datetime.fromisoformat(row['data_timestamp'])
+                        except Exception:
+                            pass
+                    
+                    results.append(TickerRSI(
+                        ticker=row['ticker'],
+                        tradingview_slug=row['tradingview_slug'],
+                        rsi_14=row['rsi_14'],
+                        last_close=row['last_close'],
+                        data_date=row['data_date'],
+                        data_timestamp=data_timestamp,
+                        updated_at=datetime.fromisoformat(row['updated_at'])
+                    ))
+                return results
+    
+    async def cleanup_old_ticker_rsi(self, days_to_keep: int = 30):
+        """Remove ticker RSI records older than specified days."""
+        cutoff = (datetime.utcnow() - timedelta(days=days_to_keep)).isoformat()
+        
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "DELETE FROM ticker_rsi WHERE updated_at < ?",
+                (cutoff,)
+            )
+            await db.commit()
+            return cursor.rowcount
 
     # ==================== Helper Methods ====================
 

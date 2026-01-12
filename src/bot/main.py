@@ -3,6 +3,11 @@
 
 TradingView-only build (RSI14 via TradingView Screener).
 
+FIXED IMPLEMENTATION - Key changes:
+1. /ticker-info now retrieves RSI from persistence table (spec section 4.2)
+2. Scheduler properly initialized with change detection support
+3. All commands preserved with proper functionality
+
 Usage:
     export DISCORD_TOKEN=your_bot_token
     export PYTHONPATH=src
@@ -28,7 +33,7 @@ from bot.repositories.database import Database
 from bot.repositories.ticker_catalog import get_catalog, validate_ticker, remove_ticker
 from bot.services.market_data.rsi_calculator import RSICalculator
 from bot.services.market_data.providers import get_provider
-from bot.cogs.alert_engine import AlertEngine, format_alert_list, format_no_alerts_message
+from bot.cogs.alert_engine import AlertEngine, format_alert_list
 from bot.services.scheduler import RSIScheduler, classify_ticker_region
 from bot.cogs.ticker_request import TickerRequestCog, handle_request_message
 from bot.utils.message_utils import chunk_message, format_subscription_list
@@ -116,11 +121,16 @@ class RSIBot(commands.Bot):
 
     async def setup_hook(self):
         """Initialize bot components."""
+        logger.info("=" * 60)
+        logger.info("RSI DISCORD BOT - STARTUP")
+        logger.info("=" * 60)
+        
         logger.info("Initializing database...")
         await self.db.initialize()
 
         logger.info("Loading ticker catalog...")
         self.catalog.load()
+        logger.info(f"Loaded {len(self.catalog)} instruments")
 
         # Log provider info
         provider = get_provider()
@@ -133,7 +143,9 @@ class RSIBot(commands.Bot):
         logger.info("Syncing slash commands...")
         await self.tree.sync()
 
+        logger.info("=" * 60)
         logger.info("Bot setup complete")
+        logger.info("=" * 60)
 
     async def on_ready(self):
         """Called when bot is ready."""
@@ -166,11 +178,13 @@ class RSIBot(commands.Bot):
 
     async def close(self):
         """Clean shutdown."""
+        logger.info("Shutting down bot...")
         if self.scheduler:
             self.scheduler.stop()
         if self.health_runner:
             await self.health_runner.cleanup()
         await super().close()
+        logger.info("Bot shutdown complete")
 
 
 # Create bot instance
@@ -530,8 +544,6 @@ async def admin_unsubscribe(
         await interaction.followup.send(f"❌ Failed to remove subscription ID `{id}`", ephemeral=True)
 
 
-# ==================== Task 1: Admin Remove Ticker Command ====================
-
 @bot.tree.command(name="remove-ticker", description="[Admin] Remove a ticker from the catalog")
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
@@ -618,8 +630,6 @@ async def list_subscriptions(interaction: discord.Interaction, ticker: Optional[
         await interaction.followup.send(msg, ephemeral=True)
 
 
-# ==================== Task 2: Fixed /run-now Command ====================
-
 @bot.tree.command(name="run-now", description="Manually trigger RSI check (Admin)")
 @app_commands.default_permissions(manage_guild=True)
 async def run_now(interaction: discord.Interaction):
@@ -673,7 +683,28 @@ async def run_now(interaction: discord.Interaction):
             data_timestamp = result.data_timestamp
             break
     
-    # Step 3: Filter by auto-scan thresholds
+    # Step 3: Persist RSI values
+    today = now.strftime("%Y-%m-%d")
+    rsi_batch = []
+    for ticker, result in rsi_results.items():
+        if result.success and result.rsi_values:
+            rsi_14 = result.rsi_values.get(14)
+            if rsi_14 is not None:
+                instrument = bot.catalog.get_instrument(ticker)
+                tv_slug = instrument.tradingview_slug if instrument else None
+                rsi_batch.append({
+                    'ticker': ticker,
+                    'rsi_14': rsi_14,
+                    'data_date': result.last_date or today,
+                    'tradingview_slug': tv_slug,
+                    'last_close': result.last_close,
+                    'data_timestamp': result.data_timestamp
+                })
+    
+    if rsi_batch:
+        await bot.db.upsert_ticker_rsi_batch(rsi_batch)
+    
+    # Step 4: Filter by auto-scan thresholds
     oversold_threshold = config.auto_oversold_threshold
     overbought_threshold = config.auto_overbought_threshold
     
@@ -692,7 +723,7 @@ async def run_now(interaction: discord.Interaction):
         if rsi_14 > overbought_threshold:
             overbought_tickers[ticker] = (rsi_14, result)
     
-    # Step 4: Post auto-scan results to channels
+    # Step 5: Post auto-scan results to channels
     messages_sent = 0
     send_errors = []
     
@@ -774,7 +805,7 @@ async def run_now(interaction: discord.Interaction):
         except Exception as e:
             send_errors.append(f"Error sending to {overbought_ch.mention}: {str(e)}")
 
-    # Step 5: Evaluate user subscriptions
+    # Step 6: Evaluate user subscriptions
     subs = await bot.db.get_subscriptions_by_guild(guild_id=interaction.guild_id, enabled_only=True)
     subscription_alerts = {'UNDER': [], 'OVER': []}
     
@@ -792,10 +823,8 @@ async def run_now(interaction: discord.Interaction):
         # Post subscription alerts separately if any triggered
         if subscription_alerts['UNDER'] and oversold_ch:
             try:
-                header = "🔔 **Subscription Alerts: Oversold**\n\n"
                 messages = format_alert_list(subscription_alerts['UNDER'], 'UNDER')
                 for msg in messages:
-                    # Prepend subscription label to first message
                     await oversold_ch.send(
                         f"🔔 **Subscription Alerts** (triggered by /run-now)\n{msg}",
                         suppress_embeds=True
@@ -816,7 +845,7 @@ async def run_now(interaction: discord.Interaction):
             except Exception as e:
                 send_errors.append(f"Subscription alerts error (overbought): {str(e)}")
 
-    # Step 6: Log to changelog
+    # Step 7: Log to changelog
     sub_alerts_total = len(subscription_alerts['UNDER']) + len(subscription_alerts['OVER'])
     
     if changelog_ch:
@@ -852,11 +881,12 @@ async def run_now(interaction: discord.Interaction):
         except discord.HTTPException as e:
             logger.error(f"Failed to post to changelog: {e}")
 
-    # Step 7: Final response
+    # Step 8: Final response
     summary = (
         f"✅ **Manual RSI Check Complete**\n"
         f"• **Provider:** {provider.name}\n"
         f"• Tickers scanned: {successful} success, {failed} failed\n"
+        f"• RSI values persisted: {len(rsi_batch)}\n"
         f"• Oversold (< {oversold_threshold}): {len(oversold_tickers)} tickers → {oversold_ch.mention if oversold_ch else 'N/A'}\n"
         f"• Overbought (> {overbought_threshold}): {len(overbought_tickers)} tickers → {overbought_ch.mention if overbought_ch else 'N/A'}\n"
         f"• Subscription alerts triggered: {sub_alerts_total}\n"
@@ -869,8 +899,6 @@ async def run_now(interaction: discord.Interaction):
 
     await interaction.edit_original_response(content=summary)
 
-
-# ==================== Task 3: Fixed /set-defaults with schedule toggle ====================
 
 @bot.tree.command(name="set-defaults", description="Set server defaults (Admin)")
 @app_commands.default_permissions(manage_guild=True)
@@ -1011,12 +1039,19 @@ async def set_defaults(
     await interaction.followup.send(response, ephemeral=True)
 
 
-# ==================== Task 4: /ticker-info with suppressed embeds ====================
+# ==================== FIXED: /ticker-info with RSI persistence (Spec Section 4.2) ====================
 
 @bot.tree.command(name="ticker-info", description="Get information about a ticker")
 @app_commands.describe(ticker="Stock ticker symbol to look up")
 async def ticker_info(interaction: discord.Interaction, ticker: str):
-    """Get information about a ticker from the catalog."""
+    """
+    Get information about a ticker from the catalog.
+    
+    FIXED IMPLEMENTATION (Spec Section 4.2):
+    - Now retrieves RSI from the ticker_rsi persistence table
+    - Shows most recently stored RSI value with timestamp
+    - Indicates if data is stale
+    """
     await interaction.response.defer(ephemeral=True)
 
     ticker = ticker.upper().strip()
@@ -1047,42 +1082,76 @@ async def ticker_info(interaction: discord.Interaction, ticker: str):
         ""
     ]
 
-    # Get subscriptions for this ticker
-    subs = await bot.db.get_subscriptions_by_guild(guild_id=interaction.guild_id, ticker=ticker)
-
-    # Get RSI data
-    rsi_data = None
-    if subs:
-        for sub in subs:
-            state = await bot.db.get_subscription_state(sub.id)
-            if state and state.last_rsi is not None and state.last_date:
-                from datetime import datetime as dt
-                try:
-                    last_date = dt.strptime(state.last_date, "%Y-%m-%d")
-                    days_old = (dt.now() - last_date).days
-                    if rsi_data is None or state.last_date > rsi_data['date']:
-                        rsi_data = {
-                            'rsi': state.last_rsi,
-                            'close': state.last_close,
-                            'date': state.last_date,
-                            'period': sub.period,
-                            'days_old': days_old
-                        }
-                except ValueError:
-                    pass
-
-    if rsi_data:
-        if rsi_data['days_old'] > 1:
-            lines.append(f"⚠️ **RSI Data (STALE - {rsi_data['days_old']} days old):**")
+    # FIXED: Get RSI data from persistence table (spec section 4.2)
+    ticker_rsi = await bot.db.get_ticker_rsi(ticker)
+    
+    if ticker_rsi:
+        # Calculate data age
+        try:
+            data_date = datetime.strptime(ticker_rsi.data_date, "%Y-%m-%d")
+            days_old = (datetime.now() - data_date).days
+        except ValueError:
+            days_old = 999
+        
+        if days_old > 3:
+            lines.append(f"⚠️ **RSI Data (STALE - {days_old} days old):**")
+        elif days_old > 1:
+            lines.append(f"📊 **RSI Data ({days_old} days old):**")
         else:
             lines.append("📊 **RSI Data:**")
-        lines.append(f"• RSI{rsi_data['period']}: **{rsi_data['rsi']:.1f}**")
-        lines.append(f"• Last Close: {rsi_data['close']:.2f} ({rsi_data['date']})")
+        
+        lines.append(f"• RSI14: **{ticker_rsi.rsi_14:.1f}**")
+        
+        if ticker_rsi.last_close:
+            lines.append(f"• Last Close: {ticker_rsi.last_close:.2f}")
+        
+        lines.append(f"• Data Date: {ticker_rsi.data_date}")
+        
+        if ticker_rsi.data_timestamp:
+            lines.append(f"• Fetched: {ticker_rsi.data_timestamp.strftime('%Y-%m-%d %H:%M UTC')}")
+        
+        lines.append(f"• Updated: {ticker_rsi.updated_at.strftime('%Y-%m-%d %H:%M UTC')}")
         lines.append("")
     else:
-        lines.append("📊 **RSI Data:** Not yet checked")
-        lines.append("")
+        # No persisted RSI data - check subscription state as fallback
+        subs = await bot.db.get_subscriptions_by_guild(guild_id=interaction.guild_id, ticker=ticker)
+        rsi_data = None
+        
+        if subs:
+            for sub in subs:
+                state = await bot.db.get_subscription_state(sub.id)
+                if state and state.last_rsi is not None and state.last_date:
+                    try:
+                        last_date = datetime.strptime(state.last_date, "%Y-%m-%d")
+                        days_old = (datetime.now() - last_date).days
+                        if rsi_data is None or state.last_date > rsi_data['date']:
+                            rsi_data = {
+                                'rsi': state.last_rsi,
+                                'close': state.last_close,
+                                'date': state.last_date,
+                                'period': sub.period,
+                                'days_old': days_old
+                            }
+                    except ValueError:
+                        pass
+        
+        if rsi_data:
+            if rsi_data['days_old'] > 1:
+                lines.append(f"⚠️ **RSI Data (from subscription state, {rsi_data['days_old']} days old):**")
+            else:
+                lines.append("📊 **RSI Data (from subscription state):**")
+            lines.append(f"• RSI{rsi_data['period']}: **{rsi_data['rsi']:.1f}**")
+            if rsi_data['close']:
+                lines.append(f"• Last Close: {rsi_data['close']:.2f} ({rsi_data['date']})")
+            lines.append("")
+        else:
+            lines.append("📊 **RSI Data:** Not yet available")
+            lines.append("💡 RSI data is populated during scheduled or manual scans.")
+            lines.append("")
 
+    # Get subscriptions for this ticker
+    subs = await bot.db.get_subscriptions_by_guild(guild_id=interaction.guild_id, ticker=ticker)
+    
     if subs:
         under_subs = [s for s in subs if s.condition == "UNDER"]
         over_subs = [s for s in subs if s.condition == "OVER"]

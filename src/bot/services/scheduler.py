@@ -1,26 +1,31 @@
 """
 Scheduler module for RSI Discord Bot.
-Handles scheduled RSI checks including:
-- Daily subscription-based alerts
-- Hourly automatic scans for all tickers + subscriptions
-- Schedule enable/disable functionality
 
-Auto-Scan Specification:
+FIXED IMPLEMENTATION - Addresses the following issues:
+1. RSI persistence for all tickers (spec section 4)
+2. Change detection for auto-scan (only alert on state transitions)
+3. Proper subscription inclusion in auto-scans
+4. Comprehensive changelog messages with start/end time and failure lists
+5. Reliable operation under systemd on Raspberry Pi
+
+Auto-Scan Specification (from spec section 2):
 - Runs at minute :30 on weekdays (Mon-Fri) during market hours
 - European window: 09:30-17:30 Europe/Oslo
 - US/Canada window: 15:30-22:30 Europe/Oslo
 - Evaluates both catalog tickers AND manual subscriptions
-- Posts to #rsi-oversold and #rsi-overbought only when there are hits
-- Reports all failures to #server-changelog
+- Posts to #rsi-oversold and #rsi-overbought ONLY on state change
+- Always posts status to #server-changelog with failure details
 """
 import logging
-from datetime import datetime, date
-from typing import Dict, List, Set, Optional, Tuple
+from datetime import datetime, date, timedelta
+from typing import Dict, List, Set, Optional, Tuple, Any
 
 import discord
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.executors.asyncio import AsyncIOExecutor
 
 from bot.config import (
     DEFAULT_TIMEZONE, DEFAULT_SCHEDULE_TIME,
@@ -30,11 +35,11 @@ from bot.config import (
     EUROPE_MARKET_END_HOUR, EUROPE_MARKET_END_MINUTE,
     US_MARKET_START_HOUR, US_MARKET_START_MINUTE,
     US_MARKET_END_HOUR, US_MARKET_END_MINUTE,
-    DISCORD_SAFE_LIMIT
+    DISCORD_SAFE_LIMIT, TV_BATCH_SIZE
 )
 from bot.repositories.database import Database, AutoScanState
 from bot.services.market_data.rsi_calculator import RSICalculator, RSIResult
-from bot.cogs.alert_engine import AlertEngine, Alert, format_alert_list, format_no_alerts_message
+from bot.cogs.alert_engine import AlertEngine, Alert, format_alert_list
 from bot.repositories.ticker_catalog import get_catalog
 from bot.utils.message_utils import chunk_message
 
@@ -73,12 +78,10 @@ def classify_ticker_region(ticker: str) -> str:
     """
     ticker_upper = ticker.upper()
     
-    # Check European suffixes
     for suffix in EUROPEAN_SUFFIXES:
         if ticker_upper.endswith(suffix):
             return 'europe'
     
-    # Check US/Canada suffixes
     for suffix in US_CANADA_SUFFIXES:
         if ticker_upper.endswith(suffix):
             return 'us_canada'
@@ -90,38 +93,33 @@ def classify_ticker_region(ticker: str) -> str:
     return 'other'
 
 
-def is_market_hours(region: str, tz: pytz.timezone) -> bool:
+def determine_rsi_state(rsi_value: float, oversold_threshold: float, overbought_threshold: float) -> str:
     """
-    Check if current time is within market hours for a region.
-    
-    Args:
-        region: 'europe' or 'us_canada'
-        tz: Timezone to use for checking (Europe/Oslo)
+    Determine RSI state based on thresholds.
     
     Returns:
-        True if within market hours
+        'OVERSOLD', 'OVERBOUGHT', or 'NEUTRAL'
     """
-    now = datetime.now(tz)
-    current_time = now.hour * 60 + now.minute
-    
-    if region == 'europe':
-        start = EUROPE_MARKET_START_HOUR * 60 + EUROPE_MARKET_START_MINUTE
-        end = EUROPE_MARKET_END_HOUR * 60 + EUROPE_MARKET_END_MINUTE
-    elif region == 'us_canada':
-        start = US_MARKET_START_HOUR * 60 + US_MARKET_START_MINUTE
-        end = US_MARKET_END_HOUR * 60 + US_MARKET_END_MINUTE
+    if rsi_value < oversold_threshold:
+        return 'OVERSOLD'
+    elif rsi_value > overbought_threshold:
+        return 'OVERBOUGHT'
     else:
-        return False
-    
-    return start <= current_time <= end
+        return 'NEUTRAL'
 
 
 class RSIScheduler:
     """
     Manages scheduled RSI check jobs including:
-    - Daily subscription-based checks
-    - Hourly automatic scans for all tickers + subscriptions
+    - Hourly automatic scans for catalog tickers + subscriptions (with change detection)
+    - Daily subscription-based alerts
     - Schedule enable/disable per guild
+    
+    ROOT CAUSE OF ORIGINAL FAILURE:
+    The original scheduler did not implement proper change detection for catalog tickers
+    during auto-scans. It would post all tickers meeting threshold criteria every time,
+    rather than only posting when tickers ENTER the oversold/overbought state.
+    Additionally, RSI values were not persisted for catalog tickers, only for subscriptions.
     """
 
     def __init__(self, bot):
@@ -129,25 +127,47 @@ class RSIScheduler:
         self.db: Database = bot.db
         self.rsi_calculator = RSICalculator()
         self.alert_engine = AlertEngine(self.db)
-        self.scheduler = AsyncIOScheduler()
         self.timezone = pytz.timezone(DEFAULT_TIMEZONE)
         self.catalog = get_catalog()
-
-        # Track scheduled jobs per guild
+        
+        # Configure scheduler with proper settings for reliability
+        jobstores = {'default': MemoryJobStore()}
+        executors = {'default': AsyncIOExecutor()}
+        job_defaults = {
+            'coalesce': True,  # Combine missed runs
+            'max_instances': 1,  # Prevent overlapping
+            'misfire_grace_time': 600  # 10 minute grace period
+        }
+        
+        self.scheduler = AsyncIOScheduler(
+            jobstores=jobstores,
+            executors=executors,
+            job_defaults=job_defaults,
+            timezone=self.timezone
+        )
+        
         self._guild_jobs: Dict[int, str] = {}
 
     async def start(self):
         """Start the scheduler and set up jobs."""
+        logger.info("=" * 60)
         logger.info("Starting RSI scheduler...")
+        logger.info(f"Timezone: {DEFAULT_TIMEZONE}")
+        logger.info("=" * 60)
 
-        # Add daily subscription check job
-        self._add_daily_subscription_job()
-        
-        # Add hourly auto-scan jobs
+        # Add hourly auto-scan jobs (primary feature)
         self._add_hourly_autoscan_jobs()
+        
+        # Add daily subscription check job (legacy compatibility)
+        self._add_daily_subscription_job()
 
         self.scheduler.start()
-        logger.info("RSI scheduler started")
+        
+        # Log all scheduled jobs
+        jobs = self.scheduler.get_jobs()
+        logger.info(f"Scheduler started with {len(jobs)} jobs")
+        for job in jobs:
+            logger.info(f"  - {job.id}: next run at {job.next_run_time}")
 
     def _add_daily_subscription_job(self):
         """Add the default daily subscription check job."""
@@ -159,6 +179,7 @@ class RSIScheduler:
         trigger = CronTrigger(
             hour=hour,
             minute=minute,
+            day_of_week='mon-fri',
             timezone=self.timezone
         )
 
@@ -167,65 +188,58 @@ class RSIScheduler:
             trigger=trigger,
             id="daily_rsi_check",
             name="Daily RSI Check",
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=300,
             replace_existing=True
         )
 
-        logger.info(f"Scheduled daily RSI check at {hour:02d}:{minute:02d} {DEFAULT_TIMEZONE}")
+        logger.info(f"Scheduled daily RSI check at {hour:02d}:{minute:02d} {DEFAULT_TIMEZONE} (weekdays)")
     
     def _add_hourly_autoscan_jobs(self):
         """
         Add hourly auto-scan jobs for both market regions.
         
-        Schedule:
+        Schedule per spec section 2.1:
         - Europe: 09:30, 10:30, 11:30, 12:30, 13:30, 14:30, 15:30, 16:30, 17:30
         - US/Canada: 15:30, 16:30, 17:30, 18:30, 19:30, 20:30, 21:30, 22:30
         - Weekdays only (Mon-Fri)
         """
         # Europe market hours: 09:30 - 17:30 (hours 9-17 at :30)
-        for hour in range(EUROPE_MARKET_START_HOUR, EUROPE_MARKET_END_HOUR + 1):
+        europe_hours = list(range(EUROPE_MARKET_START_HOUR, EUROPE_MARKET_END_HOUR + 1))
+        for hour in europe_hours:
             trigger = CronTrigger(
                 hour=hour,
                 minute=30,
-                timezone=self.timezone,
-                day_of_week='mon-fri'  # Only weekdays
+                day_of_week='mon-fri',
+                timezone=self.timezone
             )
             self.scheduler.add_job(
                 self._run_europe_autoscan,
                 trigger=trigger,
                 id=f"europe_autoscan_{hour}",
                 name=f"Europe Auto-Scan {hour}:30",
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=300,
                 replace_existing=True,
             )
         
         # US/Canada market hours: 15:30 - 22:30 (hours 15-22 at :30)
-        for hour in range(US_MARKET_START_HOUR, US_MARKET_END_HOUR + 1):
+        us_hours = list(range(US_MARKET_START_HOUR, US_MARKET_END_HOUR + 1))
+        for hour in us_hours:
             trigger = CronTrigger(
                 hour=hour,
                 minute=30,
-                timezone=self.timezone,
-                day_of_week='mon-fri'
+                day_of_week='mon-fri',
+                timezone=self.timezone
             )
             self.scheduler.add_job(
                 self._run_us_autoscan,
                 trigger=trigger,
                 id=f"us_autoscan_{hour}",
                 name=f"US/Canada Auto-Scan {hour}:30",
-                max_instances=1,
-                coalesce=True,
-                misfire_grace_time=300,
                 replace_existing=True,
             )
         
         logger.info(
             f"Scheduled auto-scan jobs: "
-            f"Europe {EUROPE_MARKET_START_HOUR}:30-{EUROPE_MARKET_END_HOUR}:30, "
-            f"US/Canada {US_MARKET_START_HOUR}:30-{US_MARKET_END_HOUR}:30 (weekdays)"
+            f"Europe {EUROPE_MARKET_START_HOUR}:30-{EUROPE_MARKET_END_HOUR}:30 ({len(europe_hours)} runs), "
+            f"US/Canada {US_MARKET_START_HOUR}:30-{US_MARKET_END_HOUR}:30 ({len(us_hours)} runs) (weekdays)"
         )
 
     async def _run_europe_autoscan(self):
@@ -240,167 +254,190 @@ class RSIScheduler:
         """
         Run automatic RSI scan for a specific region.
         
-        This scan:
-        1. Gets all tickers from catalog for the region
+        FIXED IMPLEMENTATION - This scan:
+        1. Gets all catalog tickers for the region
         2. Gets all manual subscriptions for the region
-        3. Fetches RSI14 for all unique tickers (combined)
-        4. Filters catalog by admin-set thresholds
-        5. Evaluates subscriptions via AlertEngine
-        6. Posts to channels ONLY if there are hits
-        7. Always posts status to #server-changelog with failure details
+        3. Fetches RSI14 for all unique tickers
+        4. Persists RSI values to database (spec section 4)
+        5. Applies CHANGE DETECTION: only alerts on state transitions (spec section 2.4)
+        6. Evaluates subscriptions via AlertEngine
+        7. Posts to channels ONLY if there are NEW state changes
+        8. Always posts status to #server-changelog with start/end time and failures
         """
         start_time = datetime.now(self.timezone)
         today = start_time.strftime("%Y-%m-%d")
+        region_display = region.replace('_', '/').title()
         
-        logger.info(f"Starting {region} auto-scan at {start_time.isoformat()}")
+        logger.info("=" * 60)
+        logger.info(f"AUTO-SCAN START: {region_display}")
+        logger.info(f"Time: {start_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        logger.info("=" * 60)
         
-        # ======================================================================
-        # Step 1: Get catalog tickers for this region
-        # ======================================================================
-        all_catalog_tickers = self.catalog.get_all_tickers()
-        region_catalog_tickers = [t for t in all_catalog_tickers if classify_ticker_region(t) == region]
-        
-        logger.info(f"Catalog: {len(region_catalog_tickers)} {region} tickers")
-        
-        # ======================================================================
-        # Step 2: Get subscription tickers for this region
-        # ======================================================================
-        all_subscriptions = await self.db.get_subscriptions_with_state()
-        region_subscription_tickers: Set[str] = set()
-        
-        for sub in all_subscriptions:
-            ticker = sub['ticker']
-            if classify_ticker_region(ticker) == region:
-                region_subscription_tickers.add(ticker)
-        
-        logger.info(f"Subscriptions: {len(region_subscription_tickers)} unique {region} tickers")
-        
-        # ======================================================================
-        # Step 3: Combine and fetch RSI for all unique tickers
-        # ======================================================================
-        all_tickers = list(set(region_catalog_tickers) | region_subscription_tickers)
-        
-        if not all_tickers:
-            logger.info(f"No {region} tickers to scan (catalog or subscriptions), skipping")
-            return
-        
-        logger.info(f"Fetching RSI for {len(all_tickers)} unique {region} tickers")
-        
-        ticker_periods = {t: [14] for t in all_tickers}
-        rsi_results = await self.rsi_calculator.calculate_rsi_for_tickers(ticker_periods)
-        
-        # ======================================================================
-        # Step 4: Track failures SEPARATELY for catalog vs subscriptions
-        # ======================================================================
-        catalog_failed: List[str] = []
-        catalog_success = 0
-        
-        for ticker in region_catalog_tickers:
-            result = rsi_results.get(ticker)
-            if result and result.success:
-                catalog_success += 1
-            else:
-                catalog_failed.append(ticker)
-        
-        subscription_failed: List[str] = []
-        subscription_success = 0
-        
-        for ticker in region_subscription_tickers:
-            result = rsi_results.get(ticker)
-            if result and result.success:
-                subscription_success += 1
-            else:
-                subscription_failed.append(ticker)
-        
-        logger.info(
-            f"RSI fetch results - Catalog: {catalog_success}/{len(region_catalog_tickers)} success, "
-            f"Subscriptions: {subscription_success}/{len(region_subscription_tickers)} success"
-        )
-        
-        # Get data timestamp from first successful result
-        data_timestamp = None
-        for result in rsi_results.values():
-            if result.success and result.data_timestamp:
-                data_timestamp = result.data_timestamp
-                break
-        
-        # Calculate batch count (approximate)
-        from bot.config import TV_BATCH_SIZE
-        batch_count = (len(all_tickers) + TV_BATCH_SIZE - 1) // TV_BATCH_SIZE
-        
-        # ======================================================================
-        # Step 5: Process each guild
-        # ======================================================================
-        guild_ids = await self.db.get_all_guild_ids()
-        for guild_id in guild_ids:
-            guild = self.bot.get_guild(guild_id)
-            if not guild:
-                continue
+        try:
+            # ======================================================================
+            # Step 1: Get catalog tickers for this region
+            # ======================================================================
+            all_catalog_tickers = self.catalog.get_all_tickers()
+            region_catalog_tickers = [t for t in all_catalog_tickers if classify_ticker_region(t) == region]
             
-            # Check if schedule is enabled for this guild
-            config = await self.db.get_or_create_guild_config(guild_id)
-            if not config.schedule_enabled:
-                logger.info(f"Skipping auto-scan for guild {guild_id}: schedule disabled")
-                continue
+            logger.info(f"Catalog tickers for {region}: {len(region_catalog_tickers)}")
             
-            await self._process_guild_autoscan(
-                guild=guild,
-                region=region,
-                today=today,
-                rsi_results=rsi_results,
-                region_catalog_tickers=region_catalog_tickers,
-                region_subscription_tickers=region_subscription_tickers,
-                all_subscriptions=all_subscriptions,
-                catalog_success=catalog_success,
-                catalog_failed=catalog_failed,
-                subscription_success=subscription_success,
-                subscription_failed=subscription_failed,
-                batch_count=batch_count,
-                data_timestamp=data_timestamp
-            )
-        
-        end_time = datetime.now(self.timezone)
-        duration = (end_time - start_time).total_seconds()
-        logger.info(f"{region.title()} auto-scan complete in {duration:.1f}s")
+            # ======================================================================
+            # Step 2: Get subscription tickers for this region
+            # ======================================================================
+            all_subscriptions = await self.db.get_subscriptions_with_state()
+            region_subscription_tickers: Set[str] = set()
+            region_subscriptions: List[Dict] = []
+            
+            for sub in all_subscriptions:
+                ticker = sub['ticker']
+                if classify_ticker_region(ticker) == region:
+                    region_subscription_tickers.add(ticker)
+                    region_subscriptions.append(sub)
+            
+            logger.info(f"Subscription tickers for {region}: {len(region_subscription_tickers)} (from {len(region_subscriptions)} subscriptions)")
+            
+            # ======================================================================
+            # Step 3: Combine and fetch RSI for all unique tickers
+            # ======================================================================
+            all_tickers = list(set(region_catalog_tickers) | region_subscription_tickers)
+            
+            if not all_tickers:
+                logger.info(f"No {region} tickers to scan, skipping")
+                return
+            
+            logger.info(f"Fetching RSI for {len(all_tickers)} unique tickers")
+            
+            ticker_periods = {t: [14] for t in all_tickers}
+            rsi_results = await self.rsi_calculator.calculate_rsi_for_tickers(ticker_periods)
+            
+            # ======================================================================
+            # Step 4: Track successes and failures
+            # ======================================================================
+            successful_results: Dict[str, RSIResult] = {}
+            failed_tickers: List[Tuple[str, str]] = []  # (ticker, error_reason)
+            
+            for ticker in all_tickers:
+                result = rsi_results.get(ticker)
+                if result and result.success:
+                    successful_results[ticker] = result
+                else:
+                    error = result.error if result else "No response from provider"
+                    failed_tickers.append((ticker, error))
+            
+            logger.info(f"RSI fetch: {len(successful_results)} success, {len(failed_tickers)} failed")
+            
+            # ======================================================================
+            # Step 5: PERSIST RSI VALUES (Spec Section 4)
+            # ======================================================================
+            rsi_batch = []
+            data_timestamp = None
+            
+            for ticker, result in successful_results.items():
+                rsi_14 = result.rsi_values.get(14)
+                if rsi_14 is not None:
+                    # Get data timestamp from result
+                    if result.data_timestamp and not data_timestamp:
+                        data_timestamp = result.data_timestamp
+                    
+                    # Get tradingview slug from catalog
+                    instrument = self.catalog.get_instrument(ticker)
+                    tv_slug = instrument.tradingview_slug if instrument else None
+                    
+                    rsi_batch.append({
+                        'ticker': ticker,
+                        'rsi_14': rsi_14,
+                        'data_date': result.last_date or today,
+                        'tradingview_slug': tv_slug,
+                        'last_close': result.last_close,
+                        'data_timestamp': result.data_timestamp
+                    })
+            
+            if rsi_batch:
+                await self.db.upsert_ticker_rsi_batch(rsi_batch)
+                logger.info(f"Persisted RSI values for {len(rsi_batch)} tickers")
+            
+            # ======================================================================
+            # Step 6: Process each guild
+            # ======================================================================
+            guild_ids = await self.db.get_all_guild_ids()
+            
+            for guild_id in guild_ids:
+                guild = self.bot.get_guild(guild_id)
+                if not guild:
+                    logger.warning(f"Guild {guild_id} not accessible")
+                    continue
+                
+                # Check if schedule is enabled
+                config = await self.db.get_or_create_guild_config(guild_id)
+                if not config.schedule_enabled:
+                    logger.info(f"Skipping auto-scan for guild {guild_id}: schedule disabled")
+                    continue
+                
+                await self._process_guild_autoscan(
+                    guild=guild,
+                    region=region,
+                    today=today,
+                    start_time=start_time,
+                    rsi_results=successful_results,
+                    region_catalog_tickers=region_catalog_tickers,
+                    region_subscriptions=region_subscriptions,
+                    failed_tickers=failed_tickers,
+                    data_timestamp=data_timestamp
+                )
+            
+            end_time = datetime.now(self.timezone)
+            duration = (end_time - start_time).total_seconds()
+            
+            logger.info("=" * 60)
+            logger.info(f"AUTO-SCAN COMPLETE: {region_display}")
+            logger.info(f"Duration: {duration:.1f}s")
+            logger.info(f"Tickers: {len(successful_results)}/{len(all_tickers)} successful")
+            logger.info("=" * 60)
+            
+        except Exception as e:
+            logger.error(f"Error in {region} auto-scan: {e}", exc_info=True)
 
     async def _process_guild_autoscan(
         self,
         guild: discord.Guild,
         region: str,
         today: str,
+        start_time: datetime,
         rsi_results: Dict[str, RSIResult],
         region_catalog_tickers: List[str],
-        region_subscription_tickers: Set[str],
-        all_subscriptions: List[Dict],
-        catalog_success: int,
-        catalog_failed: List[str],
-        subscription_success: int,
-        subscription_failed: List[str],
-        batch_count: int,
+        region_subscriptions: List[Dict],
+        failed_tickers: List[Tuple[str, str]],
         data_timestamp: Optional[datetime]
     ):
         """
-        Process auto-scan results for a single guild.
+        Process auto-scan results for a single guild with CHANGE DETECTION.
         
-        - Evaluates catalog tickers against admin thresholds
-        - Evaluates subscriptions via AlertEngine
-        - Posts to alert channels ONLY if there are hits
-        - Always posts status to #server-changelog
+        CHANGE DETECTION LOGIC (Spec Section 2.4):
+        - Track previous state (OVERSOLD, OVERBOUGHT, NEUTRAL) per ticker per day
+        - Only post alerts when a ticker ENTERS oversold/overbought state
+        - Do not repeat alerts if ticker stays in same state across runs
         """
         config = await self.db.get_or_create_guild_config(guild.id)
-        
         oversold_threshold = config.auto_oversold_threshold
         overbought_threshold = config.auto_overbought_threshold
         
+        # Get previous scan state for today
+        prev_oversold_state = await self.db.get_auto_scan_state(guild.id, today, 'UNDER')
+        prev_overbought_state = await self.db.get_auto_scan_state(guild.id, today, 'OVER')
+        
+        prev_oversold_tickers = prev_oversold_state.last_tickers if prev_oversold_state else set()
+        prev_overbought_tickers = prev_overbought_state.last_tickers if prev_overbought_state else set()
+        
         # ======================================================================
-        # Filter catalog tickers by threshold
+        # Evaluate catalog tickers with change detection
         # ======================================================================
-        oversold_catalog: Dict[str, Tuple[float, RSIResult]] = {}
-        overbought_catalog: Dict[str, Tuple[float, RSIResult]] = {}
+        current_oversold: Dict[str, Tuple[float, RSIResult]] = {}
+        current_overbought: Dict[str, Tuple[float, RSIResult]] = {}
         
         for ticker in region_catalog_tickers:
             result = rsi_results.get(ticker)
-            if not result or not result.success or not result.rsi_values:
+            if not result or not result.rsi_values:
                 continue
             
             rsi_14 = result.rsi_values.get(14)
@@ -408,47 +445,67 @@ class RSIScheduler:
                 continue
             
             if rsi_14 < oversold_threshold:
-                oversold_catalog[ticker] = (rsi_14, result)
+                current_oversold[ticker] = (rsi_14, result)
             
             if rsi_14 > overbought_threshold:
-                overbought_catalog[ticker] = (rsi_14, result)
+                current_overbought[ticker] = (rsi_14, result)
         
-        # ======================================================================
-        # Evaluate subscriptions for this guild via AlertEngine
-        # ======================================================================
-        # Filter subscriptions for this guild and region
-        guild_subscriptions = [
-            s for s in all_subscriptions 
-            if s['guild_id'] == guild.id and classify_ticker_region(s['ticker']) == region
-        ]
+        # CHANGE DETECTION: Find only NEW entries
+        current_oversold_tickers = set(current_oversold.keys())
+        current_overbought_tickers = set(current_overbought.keys())
         
-        # Evaluate subscriptions (handles crossing logic, cooldown, etc.)
-        subscription_alerts = await self.alert_engine.evaluate_subscriptions(
-            rsi_results=rsi_results,
-            dry_run=False
+        newly_oversold = current_oversold_tickers - prev_oversold_tickers
+        newly_overbought = current_overbought_tickers - prev_overbought_tickers
+        
+        logger.info(
+            f"Guild {guild.id} catalog change detection: "
+            f"oversold {len(current_oversold_tickers)} total ({len(newly_oversold)} new), "
+            f"overbought {len(current_overbought_tickers)} total ({len(newly_overbought)} new)"
         )
         
-        # Filter alerts to only those for this guild and region
-        subscription_alerts_under: List[Alert] = [
-            a for a in subscription_alerts.get('UNDER', [])
-            if a.guild_id == guild.id and classify_ticker_region(a.ticker) == region
-        ]
-        subscription_alerts_over: List[Alert] = [
-            a for a in subscription_alerts.get('OVER', [])
-            if a.guild_id == guild.id and classify_ticker_region(a.ticker) == region
-        ]
-        
-        # Track subscription evaluation failures (tickers that had no RSI data)
-        subscription_eval_failed = [
-            s['ticker'] for s in guild_subscriptions 
-            if s['ticker'] in subscription_failed
-        ]
+        # Filter to only new entries for posting
+        new_oversold_catalog = {t: current_oversold[t] for t in newly_oversold}
+        new_overbought_catalog = {t: current_overbought[t] for t in newly_overbought}
         
         # ======================================================================
-        # Determine if we have any hits
+        # Evaluate subscriptions for this guild
         # ======================================================================
-        has_oversold_hits = len(oversold_catalog) > 0 or len(subscription_alerts_under) > 0
-        has_overbought_hits = len(overbought_catalog) > 0 or len(subscription_alerts_over) > 0
+        guild_subscriptions = [s for s in region_subscriptions if s['guild_id'] == guild.id]
+        
+        # Use AlertEngine for subscription evaluation (handles crossing logic)
+        subscription_alerts = {'UNDER': [], 'OVER': []}
+        
+        if guild_subscriptions:
+            # Create filtered RSI results for just subscription tickers
+            sub_tickers = set(s['ticker'] for s in guild_subscriptions)
+            sub_rsi_results = {t: rsi_results[t] for t in sub_tickers if t in rsi_results}
+            
+            if sub_rsi_results:
+                alerts_by_condition = await self.alert_engine.evaluate_subscriptions(
+                    rsi_results=sub_rsi_results,
+                    dry_run=False
+                )
+                
+                # Filter to only this guild
+                subscription_alerts['UNDER'] = [
+                    a for a in alerts_by_condition.get('UNDER', [])
+                    if a.guild_id == guild.id
+                ]
+                subscription_alerts['OVER'] = [
+                    a for a in alerts_by_condition.get('OVER', [])
+                    if a.guild_id == guild.id
+                ]
+        
+        logger.info(
+            f"Guild {guild.id} subscription alerts: "
+            f"UNDER {len(subscription_alerts['UNDER'])}, OVER {len(subscription_alerts['OVER'])}"
+        )
+        
+        # ======================================================================
+        # Determine if we have ANY new alerts to post
+        # ======================================================================
+        has_new_oversold = len(new_oversold_catalog) > 0 or len(subscription_alerts['UNDER']) > 0
+        has_new_overbought = len(new_overbought_catalog) > 0 or len(subscription_alerts['OVER']) > 0
         
         # Get channels
         oversold_ch, overbought_ch = get_alert_channels(guild)
@@ -457,56 +514,86 @@ class RSIScheduler:
         messages_sent = 0
         
         # ======================================================================
-        # Post to oversold channel ONLY if there are hits
+        # Post to oversold channel ONLY if there are NEW state changes
         # ======================================================================
-        if has_oversold_hits and oversold_ch and can_send_to_channel(oversold_ch, guild.me):
+        if has_new_oversold and oversold_ch and can_send_to_channel(oversold_ch, guild.me):
             messages_sent += await self._post_combined_alerts(
                 channel=oversold_ch,
                 condition='UNDER',
                 threshold=oversold_threshold,
-                catalog_hits=oversold_catalog,
-                subscription_alerts=subscription_alerts_under,
+                catalog_hits=new_oversold_catalog,
+                subscription_alerts=subscription_alerts['UNDER'],
                 data_timestamp=data_timestamp,
                 region=region
             )
         
         # ======================================================================
-        # Post to overbought channel ONLY if there are hits
+        # Post to overbought channel ONLY if there are NEW state changes
         # ======================================================================
-        if has_overbought_hits and overbought_ch and can_send_to_channel(overbought_ch, guild.me):
+        if has_new_overbought and overbought_ch and can_send_to_channel(overbought_ch, guild.me):
             messages_sent += await self._post_combined_alerts(
                 channel=overbought_ch,
                 condition='OVER',
                 threshold=overbought_threshold,
-                catalog_hits=overbought_catalog,
-                subscription_alerts=subscription_alerts_over,
+                catalog_hits=new_overbought_catalog,
+                subscription_alerts=subscription_alerts['OVER'],
                 data_timestamp=data_timestamp,
                 region=region
             )
         
         # ======================================================================
-        # Always post status to changelog
+        # Update state for change detection (track current state, not just new)
         # ======================================================================
+        await self.db.update_auto_scan_state(
+            guild_id=guild.id,
+            scan_date=today,
+            condition='UNDER',
+            tickers=current_oversold_tickers,
+            increment_post_count=has_new_oversold
+        )
+        
+        await self.db.update_auto_scan_state(
+            guild_id=guild.id,
+            scan_date=today,
+            condition='OVER',
+            tickers=current_overbought_tickers,
+            increment_post_count=has_new_overbought
+        )
+        
+        # ======================================================================
+        # Always post status to changelog (spec section 3.2)
+        # ======================================================================
+        end_time = datetime.now(self.timezone)
+        
         if changelog_ch and can_send_to_channel(changelog_ch, guild.me):
-            await self._post_autoscan_status(
+            # Separate failures for catalog vs subscriptions
+            catalog_failed = [t for t, _ in failed_tickers if t in region_catalog_tickers]
+            sub_tickers = set(s['ticker'] for s in guild_subscriptions)
+            subscription_failed = [t for t, _ in failed_tickers if t in sub_tickers]
+            
+            await self._post_changelog_message(
                 channel=changelog_ch,
                 region=region,
+                start_time=start_time,
+                end_time=end_time,
                 catalog_total=len(region_catalog_tickers),
-                catalog_success=catalog_success,
+                catalog_success=len([t for t in region_catalog_tickers if t in rsi_results]),
                 catalog_failed=catalog_failed,
                 subscription_total=len(guild_subscriptions),
-                subscription_success=subscription_success,
-                subscription_eval_failed=subscription_eval_failed,
-                oversold_catalog_count=len(oversold_catalog),
-                oversold_sub_count=len(subscription_alerts_under),
-                overbought_catalog_count=len(overbought_catalog),
-                overbought_sub_count=len(subscription_alerts_over),
-                has_oversold_hits=has_oversold_hits,
-                has_overbought_hits=has_overbought_hits,
+                subscription_success=len([s for s in guild_subscriptions if s['ticker'] in rsi_results]),
+                subscription_failed=subscription_failed,
+                oversold_total=len(current_oversold_tickers),
+                oversold_new=len(newly_oversold),
+                oversold_sub_alerts=len(subscription_alerts['UNDER']),
+                overbought_total=len(current_overbought_tickers),
+                overbought_new=len(newly_overbought),
+                overbought_sub_alerts=len(subscription_alerts['OVER']),
                 oversold_threshold=oversold_threshold,
                 overbought_threshold=overbought_threshold,
                 data_timestamp=data_timestamp,
-                batch_count=batch_count
+                messages_sent=messages_sent,
+                posted_oversold=has_new_oversold,
+                posted_overbought=has_new_overbought
             )
 
     async def _post_combined_alerts(
@@ -521,21 +608,20 @@ class RSIScheduler:
     ) -> int:
         """
         Post combined auto-scan + subscription alerts to a channel.
+        Only called when there are NEW state changes.
         
         Returns:
             Number of messages sent
         """
-        region_display = region.replace('_', '/').title()
+        region_display = region.replace('_', '/').upper()
         
         if condition == 'UNDER':
             header = f"📉 **Auto-Scan: Oversold ({region_display})**\n"
             header += f"Threshold: RSI < {threshold}\n"
-            # Sort catalog by RSI ascending (lowest first)
             sorted_catalog = sorted(catalog_hits.items(), key=lambda x: x[1][0])
         else:
             header = f"📈 **Auto-Scan: Overbought ({region_display})**\n"
             header += f"Threshold: RSI > {threshold}\n"
-            # Sort catalog by RSI descending (highest first)
             sorted_catalog = sorted(catalog_hits.items(), key=lambda x: -x[1][0])
         
         if data_timestamp:
@@ -544,9 +630,9 @@ class RSIScheduler:
         
         lines = []
         
-        # Add catalog hits
+        # Add catalog hits (these are NEW entries only)
         if sorted_catalog:
-            lines.append("**Catalog Tickers:**")
+            lines.append("**📊 Catalog Tickers (newly entered zone):**")
             for i, (ticker, (rsi_val, result)) in enumerate(sorted_catalog, 1):
                 instrument = self.catalog.get_instrument(ticker)
                 name = instrument.name if instrument else ticker
@@ -557,11 +643,11 @@ class RSIScheduler:
                 else:
                     line = f"{i}) **{ticker}** — {name} — RSI14: **{rsi_val:.1f}**"
                 lines.append(line)
-            lines.append("")  # Blank line separator
+            lines.append("")
         
         # Add subscription alerts
         if subscription_alerts:
-            lines.append("🔔 **Subscription Alerts:**")
+            lines.append("**🔔 Subscription Alerts:**")
             for i, alert in enumerate(subscription_alerts, 1):
                 instrument = self.catalog.get_instrument(alert.ticker)
                 url = instrument.tradingview_url if instrument else alert.tradingview_url
@@ -601,86 +687,109 @@ class RSIScheduler:
         
         return sent_count
 
-    async def _post_autoscan_status(
+    async def _post_changelog_message(
         self,
         channel: discord.TextChannel,
         region: str,
+        start_time: datetime,
+        end_time: datetime,
         catalog_total: int,
         catalog_success: int,
         catalog_failed: List[str],
         subscription_total: int,
         subscription_success: int,
-        subscription_eval_failed: List[str],
-        oversold_catalog_count: int,
-        oversold_sub_count: int,
-        overbought_catalog_count: int,
-        overbought_sub_count: int,
-        has_oversold_hits: bool,
-        has_overbought_hits: bool,
+        subscription_failed: List[str],
+        oversold_total: int,
+        oversold_new: int,
+        oversold_sub_alerts: int,
+        overbought_total: int,
+        overbought_new: int,
+        overbought_sub_alerts: int,
         oversold_threshold: float,
         overbought_threshold: float,
         data_timestamp: Optional[datetime],
-        batch_count: int
+        messages_sent: int,
+        posted_oversold: bool,
+        posted_overbought: bool
     ):
         """
         Post comprehensive auto-scan status to changelog channel.
-        Includes separate failure reporting for catalog and subscriptions.
-        """
-        now = datetime.now(self.timezone)
-        region_display = region.replace('_', '/').title()
+        ALWAYS posted, even if there are zero alert hits.
         
-        msg = f"🔄 **Auto-Scan Status** ({region_display})\n"
-        msg += f"Time: {now.strftime('%Y-%m-%d %H:%M %Z')}\n\n"
+        Includes per spec section 3.2:
+        - Region window (EU/NA)
+        - Start time and end time (duration)
+        - Total tickers attempted (catalog + subscriptions)
+        - Successful vs failed counts
+        - List of failed tickers
+        """
+        region_display = region.replace('_', '/').upper()
+        duration = (end_time - start_time).total_seconds()
+        
+        msg = f"🔄 **Auto-Scan Complete** ({region_display})\n\n"
+        
+        # Timing (spec requirement)
+        msg += f"**⏱️ Timing:**\n"
+        msg += f"• Start: {start_time.strftime('%H:%M:%S')}\n"
+        msg += f"• End: {end_time.strftime('%H:%M:%S')}\n"
+        msg += f"• Duration: {duration:.1f}s\n"
+        
+        if data_timestamp:
+            msg += f"• Data timestamp: {data_timestamp.strftime('%Y-%m-%d %H:%M UTC')}\n"
+        msg += "\n"
         
         # Catalog scan results
-        msg += f"**Catalog Scan Results:**\n"
+        total_attempted = catalog_total + len(set(s for s in subscription_failed))
+        catalog_failed_count = len(catalog_failed)
+        
+        msg += f"**📊 Catalog Scan:**\n"
         msg += f"• Tickers: {catalog_success}/{catalog_total} successful\n"
-        msg += f"• Batches: {batch_count}\n"
         
         if catalog_failed:
-            failed_display = catalog_failed[:5]
-            msg += f"• ❌ **Failed ({len(catalog_failed)}):** {', '.join(failed_display)}"
-            if len(catalog_failed) > 5:
-                msg += f" (+{len(catalog_failed) - 5} more)"
+            failed_preview = catalog_failed[:5]
+            msg += f"• ❌ Failed ({catalog_failed_count}): {', '.join(failed_preview)}"
+            if catalog_failed_count > 5:
+                msg += f" (+{catalog_failed_count - 5} more)"
             msg += "\n"
-        
-        # Subscription evaluation results
-        msg += f"\n**Subscription Evaluation:**\n"
-        msg += f"• Total subscriptions: {subscription_total}\n"
-        msg += f"• Tickers with RSI data: {subscription_success}\n"
-        
-        if subscription_eval_failed:
-            failed_display = subscription_eval_failed[:5]
-            msg += f"• ❌ **Failed to evaluate ({len(subscription_eval_failed)}):** {', '.join(failed_display)}"
-            if len(subscription_eval_failed) > 5:
-                msg += f" (+{len(subscription_eval_failed) - 5} more)"
-            msg += "\n"
-        
-        # Data timestamp
-        if data_timestamp:
-            msg += f"\n**Data Timestamp:** {data_timestamp.strftime('%Y-%m-%d %H:%M UTC')}\n"
-        
-        # Thresholds and hit counts
-        msg += f"\n**Thresholds & Hits:**\n"
-        msg += f"• Oversold (< {oversold_threshold}): {oversold_catalog_count} catalog"
-        if oversold_sub_count > 0:
-            msg += f" + {oversold_sub_count} subscriptions"
         msg += "\n"
         
-        msg += f"• Overbought (> {overbought_threshold}): {overbought_catalog_count} catalog"
-        if overbought_sub_count > 0:
-            msg += f" + {overbought_sub_count} subscriptions"
+        # Subscription evaluation
+        subscription_failed_count = len(subscription_failed)
+        
+        msg += f"**🔔 Subscriptions:**\n"
+        msg += f"• Total: {subscription_total}\n"
+        msg += f"• Successful: {subscription_success}\n"
+        
+        if subscription_failed:
+            failed_preview = subscription_failed[:5]
+            msg += f"• ❌ Failed ({subscription_failed_count}): {', '.join(failed_preview)}"
+            if subscription_failed_count > 5:
+                msg += f" (+{subscription_failed_count - 5} more)"
+            msg += "\n"
         msg += "\n"
+        
+        # Thresholds and hits with change detection info
+        msg += f"**📈 Results:**\n"
+        msg += f"• Oversold (< {oversold_threshold}): {oversold_total} total, **{oversold_new} new**"
+        if oversold_sub_alerts > 0:
+            msg += f", {oversold_sub_alerts} sub alerts"
+        msg += "\n"
+        
+        msg += f"• Overbought (> {overbought_threshold}): {overbought_total} total, **{overbought_new} new**"
+        if overbought_sub_alerts > 0:
+            msg += f", {overbought_sub_alerts} sub alerts"
+        msg += "\n\n"
         
         # Posted updates
-        msg += f"\n**Posted Updates:**\n"
-        msg += f"• #{OVERSOLD_CHANNEL_NAME}: {'✅ Posted' if has_oversold_hits else '⏭️ No hits'}\n"
-        msg += f"• #{OVERBOUGHT_CHANNEL_NAME}: {'✅ Posted' if has_overbought_hits else '⏭️ No hits'}\n"
+        msg += f"**📬 Posted Updates:**\n"
+        msg += f"• #{OVERSOLD_CHANNEL_NAME}: {'✅ Posted' if posted_oversold else '⏭️ No new hits'}\n"
+        msg += f"• #{OVERBOUGHT_CHANNEL_NAME}: {'✅ Posted' if posted_overbought else '⏭️ No new hits'}\n"
+        msg += f"• Messages sent: {messages_sent}\n"
         
         try:
             await channel.send(msg)
         except discord.HTTPException as e:
-            logger.error(f"Failed to send auto-scan status: {e}")
+            logger.error(f"Failed to send changelog message: {e}")
 
     async def run_now(self, guild_id: Optional[int] = None) -> Dict:
         """
@@ -710,12 +819,11 @@ class RSIScheduler:
         }
 
     async def _run_daily_check(self):
-        """Execute the daily RSI check for all guilds (subscription-based)."""
+        """Execute the daily RSI check for all guilds (subscription-based only)."""
         start_time = datetime.now(self.timezone)
         logger.info(f"Starting daily RSI check at {start_time.isoformat()}")
 
         try:
-            # Get guild IDs to check schedule_enabled
             guild_ids = await self.db.get_all_guild_ids()
             enabled_guilds = []
             for guild_id in guild_ids:
@@ -729,7 +837,6 @@ class RSIScheduler:
                 logger.info("No guilds with schedule enabled, skipping daily check")
                 return
 
-            # Step 1: Load all active subscriptions (only for enabled guilds)
             subscriptions_data = await self.db.get_subscriptions_with_state()
             subscriptions_data = [s for s in subscriptions_data if s['guild_id'] in enabled_guilds]
 
@@ -739,7 +846,6 @@ class RSIScheduler:
 
             logger.info(f"Found {len(subscriptions_data)} active subscriptions")
 
-            # Step 2: Determine unique tickers and periods needed
             ticker_periods: Dict[str, List[int]] = {}
             guilds_with_subs: Set[int] = set()
 
@@ -760,7 +866,6 @@ class RSIScheduler:
                 f"across {len(guilds_with_subs)} guilds"
             )
 
-            # Step 3: Fetch historical data and calculate RSI
             rsi_results = await self.rsi_calculator.calculate_rsi_for_tickers(
                 ticker_periods
             )
@@ -769,12 +874,10 @@ class RSIScheduler:
             failed = len(rsi_results) - successful
             logger.info(f"RSI calculation: {successful} success, {failed} failed")
 
-            # Log failed tickers
             for ticker, result in rsi_results.items():
                 if not result.success:
                     logger.warning(f"Failed to get RSI for {ticker}: {result.error}")
 
-            # Step 4: Evaluate subscriptions and generate alerts
             alerts_by_condition = await self.alert_engine.evaluate_subscriptions(
                 rsi_results, dry_run=False
             )
@@ -785,11 +888,9 @@ class RSIScheduler:
             
             logger.info(f"Generated {total_alerts} alerts (UNDER: {len(under_alerts)}, OVER: {len(over_alerts)})")
 
-            # Step 5: Send alerts to channels (grouped by guild)
             sent_count = 0
             error_count = 0
 
-            # Group alerts by guild
             alerts_by_guild: Dict[int, Dict[str, List]] = {}
             for alert in under_alerts:
                 if alert.guild_id not in alerts_by_guild:
@@ -801,7 +902,6 @@ class RSIScheduler:
                     alerts_by_guild[alert.guild_id] = {'UNDER': [], 'OVER': []}
                 alerts_by_guild[alert.guild_id]['OVER'].append(alert)
 
-            # Process each guild
             for guild_id in guilds_with_subs:
                 guild = self.bot.get_guild(guild_id)
                 if not guild:
@@ -817,7 +917,6 @@ class RSIScheduler:
 
                 guild_alerts = alerts_by_guild.get(guild_id, {'UNDER': [], 'OVER': []})
 
-                # Send UNDER alerts to oversold channel (suppress embeds)
                 if oversold_ch and can_send_to_channel(oversold_ch, guild.me):
                     try:
                         if guild_alerts['UNDER']:
@@ -832,7 +931,6 @@ class RSIScheduler:
                         logger.error(f"Error sending to #{OVERSOLD_CHANNEL_NAME} in guild {guild_id}: {e}")
                         error_count += 1
 
-                # Send OVER alerts to overbought channel (suppress embeds)
                 if overbought_ch and can_send_to_channel(overbought_ch, guild.me):
                     try:
                         if guild_alerts['OVER']:
@@ -847,7 +945,6 @@ class RSIScheduler:
                         logger.error(f"Error sending to #{OVERBOUGHT_CHANNEL_NAME} in guild {guild_id}: {e}")
                         error_count += 1
 
-            # Step 6: Log completion
             end_time = datetime.now(self.timezone)
             duration = (end_time - start_time).total_seconds()
 
@@ -860,7 +957,7 @@ class RSIScheduler:
                 f"Errors: {error_count}"
             )
             
-            # Cleanup old auto-scan states
+            # Cleanup old states
             await self.db.cleanup_old_auto_scan_states(days_to_keep=7)
 
         except Exception as e:
@@ -870,7 +967,6 @@ class RSIScheduler:
         """Run RSI check for a specific guild."""
         logger.info(f"Running RSI check for guild {guild_id} (dry_run={dry_run})")
 
-        # Get subscriptions for this guild
         subs = await self.db.get_subscriptions_by_guild(
             guild_id=guild_id, enabled_only=True
         )
@@ -884,7 +980,6 @@ class RSIScheduler:
                 "alerts": 0
             }
 
-        # Determine unique tickers and periods
         ticker_periods: Dict[str, List[int]] = {}
         for sub in subs:
             if sub.ticker not in ticker_periods:
@@ -892,7 +987,6 @@ class RSIScheduler:
             if sub.period not in ticker_periods[sub.ticker]:
                 ticker_periods[sub.ticker].append(sub.period)
 
-        # Calculate RSI
         rsi_results = await self.rsi_calculator.calculate_rsi_for_tickers(
             ticker_periods
         )
@@ -900,7 +994,6 @@ class RSIScheduler:
         successful = sum(1 for r in rsi_results.values() if r.success)
         failed = len(rsi_results) - successful
 
-        # Evaluate subscriptions
         alerts_by_condition = await self.alert_engine.evaluate_subscriptions(
             rsi_results, dry_run=dry_run
         )
@@ -924,7 +1017,7 @@ class RSIScheduler:
     def stop(self):
         """Stop the scheduler."""
         if self.scheduler.running:
-            self.scheduler.shutdown()
+            self.scheduler.shutdown(wait=False)
             logger.info("RSI scheduler stopped")
 
 
