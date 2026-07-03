@@ -14,9 +14,10 @@ Usage:
     python -m bot.main
 """
 import logging
+import re
 import sys
 from datetime import datetime
-from typing import Optional, Tuple, List, Dict, Set
+from typing import Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -27,16 +28,17 @@ from bot.config import (
     DISCORD_TOKEN, DEFAULT_OVERSOLD_THRESHOLD,
     DEFAULT_OVERBOUGHT_THRESHOLD, OVERSOLD_CHANNEL_NAME, OVERBOUGHT_CHANNEL_NAME,
     CHANGELOG_CHANNEL_NAME, REQUEST_CHANNEL_NAME, LOG_PATH,
-    DISCORD_SAFE_LIMIT, DEFAULT_TIMEZONE, TV_BATCH_SIZE
+    DEFAULT_TIMEZONE
 )
 from bot.repositories.database import Database
 from bot.repositories.ticker_catalog import get_catalog, validate_ticker, remove_ticker
-from bot.services.market_data.rsi_calculator import RSICalculator
 from bot.services.market_data.providers import get_provider
-from bot.cogs.alert_engine import AlertEngine, format_alert_list
-from bot.services.scheduler import RSIScheduler, classify_ticker_region
-from bot.cogs.ticker_request import TickerRequestCog, handle_request_message
-from bot.utils.message_utils import chunk_message, format_subscription_list
+from bot.services.scheduler import RSIScheduler
+from bot.cogs.ticker_request import handle_request_message
+from bot.utils.message_utils import format_subscription_list
+
+# Strict HH:MM validation for /set-defaults schedule_time
+SCHEDULE_TIME_PATTERN = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 # Configure logging
 logging.basicConfig(
@@ -113,10 +115,9 @@ class RSIBot(commands.Bot):
 
         self.db = Database()
         self.catalog = get_catalog()
-        self.rsi_calculator = RSICalculator()
-        self.alert_engine = AlertEngine(self.db)
+        # Scan execution (RSI fetching, alert evaluation) lives entirely in
+        # RSIScheduler - the single source of truth for the scan pipeline.
         self.scheduler: Optional[RSIScheduler] = None
-        self.ticker_request_handler = TickerRequestCog(self)
         self.health_runner = None
 
     async def setup_hook(self):
@@ -148,18 +149,52 @@ class RSIBot(commands.Bot):
         logger.info("=" * 60)
 
     async def on_ready(self):
-        """Called when bot is ready."""
+        """Called when bot is ready (also fires again after reconnects)."""
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
         logger.info(f"Connected to {len(self.guilds)} guilds")
         logger.info(f"Ticker catalog contains {len(self.catalog)} instruments")
         provider = get_provider()
         logger.info(f"RSI Provider: {provider.name}")
+
+        # Seed a default config for every guild so scheduled scans work
+        # without anyone having to run a slash command first.
+        for guild in self.guilds:
+            try:
+                await self.db.get_or_create_guild_config(guild.id)
+            except Exception:
+                logger.exception(f"Failed to ensure config for guild {guild.id}")
+
+        # (Re)register per-guild daily jobs. Idempotent, so reconnects that
+        # re-fire on_ready cannot create duplicate jobs.
+        if self.scheduler:
+            try:
+                await self.scheduler.sync_guild_daily_jobs()
+                self.scheduler.log_jobs()
+            except Exception:
+                logger.exception("Failed to sync per-guild daily jobs")
+
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
                 name="RSI levels"
             )
         )
+
+    async def on_guild_join(self, guild: discord.Guild):
+        """Provision new guilds immediately: default config + daily job."""
+        logger.info(f"Joined guild {guild.name} ({guild.id}) - creating default config")
+        try:
+            config = await self.db.get_or_create_guild_config(guild.id)
+            if self.scheduler:
+                self.scheduler.schedule_guild_daily_job(guild.id, config.default_schedule_time)
+        except Exception:
+            logger.exception(f"Failed to provision new guild {guild.id}")
+
+    async def on_guild_remove(self, guild: discord.Guild):
+        """Clean up scheduled work when the bot leaves a guild."""
+        logger.info(f"Removed from guild {guild.name} ({guild.id})")
+        if self.scheduler:
+            self.scheduler.remove_guild_daily_job(guild.id)
 
     async def on_message(self, message: discord.Message):
         """Handle messages - used for #request channel ticker additions."""
@@ -194,6 +229,7 @@ bot = RSIBot()
 # ==================== Slash Commands ====================
 
 @bot.tree.command(name="subscribe", description="Create an RSI alert subscription")
+@app_commands.guild_only()
 @app_commands.describe(
     ticker="Stock ticker symbol (must exist in tickers.csv)",
     condition="Alert condition: 'under' or 'over'",
@@ -225,8 +261,26 @@ async def subscribe(
         await interaction.followup.send("❌ Threshold must be between 0 and 100", ephemeral=True)
         return
 
+    # Reject thresholds that can never trigger (RSI is always within 0-100)
+    if condition.value == "UNDER" and threshold <= 0:
+        await interaction.followup.send(
+            "❌ An UNDER alert with threshold 0 can never trigger (RSI is never below 0)",
+            ephemeral=True
+        )
+        return
+    if condition.value == "OVER" and threshold >= 100:
+        await interaction.followup.send(
+            "❌ An OVER alert with threshold 100 can never trigger (RSI is never above 100)",
+            ephemeral=True
+        )
+        return
+
     if period is not None and period != 14:
         await interaction.followup.send("❌ Only RSI14 (period=14) is supported in this TradingView-only build", ephemeral=True)
+        return
+
+    if cooldown is not None and cooldown < 0:
+        await interaction.followup.send("❌ Cooldown must be non-negative", ephemeral=True)
         return
 
     oversold_ch, overbought_ch, error_msg = get_alert_channels(interaction.guild)
@@ -285,6 +339,7 @@ async def subscribe(
 
 
 @bot.tree.command(name="subscribe-bands", description="Create both oversold and overbought alerts for a ticker")
+@app_commands.guild_only()
 @app_commands.describe(
     ticker="Stock ticker symbol (must exist in tickers.csv)",
     oversold="Oversold threshold (default: 30)",
@@ -328,8 +383,26 @@ async def subscribe_bands(
         await interaction.followup.send("❌ Oversold threshold must be less than overbought threshold", ephemeral=True)
         return
 
+    # Reject thresholds that can never trigger (RSI is always within 0-100)
+    if oversold_threshold <= 0:
+        await interaction.followup.send(
+            "❌ An oversold threshold of 0 can never trigger (RSI is never below 0)",
+            ephemeral=True
+        )
+        return
+    if overbought_threshold >= 100:
+        await interaction.followup.send(
+            "❌ An overbought threshold of 100 can never trigger (RSI is never above 100)",
+            ephemeral=True
+        )
+        return
+
     if period is not None and period != 14:
         await interaction.followup.send("❌ Only RSI14 (period=14) is supported in this TradingView-only build", ephemeral=True)
+        return
+
+    if cooldown is not None and cooldown < 0:
+        await interaction.followup.send("❌ Cooldown must be non-negative", ephemeral=True)
         return
 
     config = await bot.db.get_or_create_guild_config(interaction.guild_id)
@@ -412,6 +485,7 @@ async def subscribe_bands(
 
 
 @bot.tree.command(name="unsubscribe", description="Remove an RSI alert subscription (your own only)")
+@app_commands.guild_only()
 @app_commands.describe(id="Subscription ID to remove (from /list)")
 async def unsubscribe(interaction: discord.Interaction, id: int):
     """Remove a subscription by ID."""
@@ -454,6 +528,7 @@ async def unsubscribe(interaction: discord.Interaction, id: int):
 
 
 @bot.tree.command(name="unsubscribe-all", description="Remove all your subscriptions")
+@app_commands.guild_only()
 async def unsubscribe_all(interaction: discord.Interaction):
     """Remove all subscriptions created by the user."""
     await interaction.response.defer(ephemeral=True)
@@ -477,6 +552,7 @@ async def unsubscribe_all(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="admin-unsubscribe", description="[Admin] Remove any subscription by ID")
+@app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     id="Subscription ID to remove",
@@ -545,6 +621,7 @@ async def admin_unsubscribe(
 
 
 @bot.tree.command(name="remove-ticker", description="[Admin] Remove a ticker from the catalog")
+@app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 @app_commands.describe(
     ticker="Ticker symbol to remove (case-insensitive)"
@@ -569,6 +646,15 @@ async def remove_ticker_cmd(
     success, message, removed_instrument = await remove_ticker(ticker)
 
     if success and removed_instrument:
+        # Policy: a ticker removed from the catalog must not leave silently
+        # broken subscriptions behind. Disable them (across all guilds) and
+        # report the count; admins can re-add the ticker and re-subscribe.
+        disabled_count = 0
+        try:
+            disabled_count = await bot.db.disable_subscriptions_for_ticker(ticker)
+        except Exception:
+            logger.exception(f"Failed to disable subscriptions for removed ticker {ticker}")
+
         # Log to changelog
         changelog_ch = get_changelog_channel(interaction.guild)
         if changelog_ch:
@@ -580,18 +666,25 @@ async def remove_ticker_cmd(
                     f"• **TradingView:** `{removed_instrument.tradingview_slug}`\n"
                     f"• **Removed by:** {interaction.user.mention}"
                 )
+                if disabled_count:
+                    log_msg += f"\n• **Subscriptions disabled:** {disabled_count}"
                 await changelog_ch.send(log_msg)
             except discord.HTTPException:
                 pass
-        
-        await interaction.followup.send(
+
+        response = (
             f"✅ **Ticker removed from catalog**\n"
             f"• **Ticker:** `{removed_instrument.ticker}`\n"
             f"• **Name:** {removed_instrument.name}\n"
             f"• **TradingView slug:** `{removed_instrument.tradingview_slug}`\n"
-            f"• **Logged to:** `#{CHANGELOG_CHANNEL_NAME}`",
-            ephemeral=True
+            f"• **Logged to:** `#{CHANGELOG_CHANNEL_NAME}`"
         )
+        if disabled_count:
+            response += (
+                f"\n• **Subscriptions disabled:** {disabled_count} "
+                f"(they will no longer be evaluated)"
+            )
+        await interaction.followup.send(response, ephemeral=True)
         logger.info(f"Successfully removed ticker {ticker} from catalog")
     else:
         await interaction.followup.send(f"❌ {message}", ephemeral=True)
@@ -599,6 +692,7 @@ async def remove_ticker_cmd(
 
 
 @bot.tree.command(name="list", description="List RSI alert subscriptions")
+@app_commands.guild_only()
 @app_commands.describe(ticker="Filter by ticker (optional)")
 async def list_subscriptions(interaction: discord.Interaction, ticker: Optional[str] = None):
     """List all subscriptions for this server with proper message chunking."""
@@ -631,276 +725,86 @@ async def list_subscriptions(interaction: discord.Interaction, ticker: Optional[
 
 
 @bot.tree.command(name="run-now", description="Manually trigger RSI check (Admin)")
+@app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
 async def run_now(interaction: discord.Interaction):
     """
-    Manually trigger RSI evaluation.
-    
-    This command:
-    1. Runs auto-scan across ALL tickers in catalog
-    2. Posts standard oversold/overbought results to alert channels
-    3. Evaluates user subscriptions and posts separately if triggered
-    4. Logs summary to #server-changelog
+    Manually trigger a full RSI scan.
+
+    Uses the exact same scan pipeline as scheduled auto-scans (all regions),
+    bypassing the schedule_enabled toggle. Posts the full oversold/overbought
+    lists, evaluates subscriptions, and logs a summary to #server-changelog.
     """
     await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.followup.send(
+            "❌ **Permission Denied**\nThis command requires the Manage Server permission.",
+            ephemeral=True
+        )
+        return
+
+    if bot.scheduler is None:
+        await interaction.followup.send(
+            "❌ Scheduler is not initialized yet. Try again shortly.", ephemeral=True
+        )
+        return
 
     oversold_ch, overbought_ch, error_msg = get_alert_channels(interaction.guild)
     if error_msg:
         await interaction.followup.send(error_msg, ephemeral=True)
         return
 
-    changelog_ch = get_changelog_channel(interaction.guild)
-    config = await bot.db.get_or_create_guild_config(interaction.guild_id)
-    
     provider = get_provider()
-    tz = pytz.timezone(DEFAULT_TIMEZONE)
-    now = datetime.now(tz)
-    
     await interaction.followup.send(
-        f"⏳ Running full auto-scan using {provider.name}...\n"
-        f"This may take a moment.",
+        f"⏳ Running full RSI scan using {provider.name}...\nThis may take a minute.",
         ephemeral=True
     )
 
-    # Step 1: Get ALL tickers from catalog
-    all_tickers = bot.catalog.get_all_tickers()
-    if not all_tickers:
-        await interaction.edit_original_response(content="❌ No tickers in catalog")
+    try:
+        summary = await bot.scheduler.run_now(
+            guild_id=interaction.guild_id,
+            triggered_by=str(interaction.user)
+        )
+    except Exception as e:
+        logger.exception("Manual /run-now failed")
+        await interaction.edit_original_response(
+            content=f"❌ **Manual RSI scan failed:** {e}\nCheck the bot logs for details."
+        )
         return
 
-    # Step 2: Fetch RSI for all tickers
-    ticker_periods = {t: [14] for t in all_tickers}
-    rsi_results = await bot.rsi_calculator.calculate_rsi_for_tickers(ticker_periods)
-    
-    successful = sum(1 for r in rsi_results.values() if r.success)
-    failed = len(rsi_results) - successful
-    batch_count = (len(all_tickers) + TV_BATCH_SIZE - 1) // TV_BATCH_SIZE
-    
-    # Get data timestamp
-    data_timestamp = None
-    for result in rsi_results.values():
-        if result.success and result.data_timestamp:
-            data_timestamp = result.data_timestamp
-            break
-    
-    # Step 3: Persist RSI values
-    today = now.strftime("%Y-%m-%d")
-    rsi_batch = []
-    for ticker, result in rsi_results.items():
-        if result.success and result.rsi_values:
-            rsi_14 = result.rsi_values.get(14)
-            if rsi_14 is not None:
-                instrument = bot.catalog.get_instrument(ticker)
-                tv_slug = instrument.tradingview_slug if instrument else None
-                rsi_batch.append({
-                    'ticker': ticker,
-                    'rsi_14': rsi_14,
-                    'data_date': result.last_date or today,
-                    'tradingview_slug': tv_slug,
-                    'last_close': result.last_close,
-                    'data_timestamp': result.data_timestamp
-                })
-    
-    if rsi_batch:
-        await bot.db.upsert_ticker_rsi_batch(rsi_batch)
-    
-    # Step 4: Filter by auto-scan thresholds
-    oversold_threshold = config.auto_oversold_threshold
-    overbought_threshold = config.auto_overbought_threshold
-    
-    oversold_tickers: Dict[str, tuple] = {}
-    overbought_tickers: Dict[str, tuple] = {}
-    
-    for ticker, result in rsi_results.items():
-        if not result.success or not result.rsi_values:
-            continue
-        rsi_14 = result.rsi_values.get(14)
-        if rsi_14 is None:
-            continue
-        
-        if rsi_14 < oversold_threshold:
-            oversold_tickers[ticker] = (rsi_14, result)
-        if rsi_14 > overbought_threshold:
-            overbought_tickers[ticker] = (rsi_14, result)
-    
-    # Step 5: Post auto-scan results to channels
-    messages_sent = 0
-    send_errors = []
-    
-    # Post oversold results
-    if oversold_ch:
-        try:
-            if oversold_tickers:
-                # Sort by RSI ascending
-                sorted_oversold = sorted(oversold_tickers.items(), key=lambda x: x[1][0])
-                header = f"📉 **RSI Auto-Scan: Oversold** (Manual Run)\n"
-                header += f"Threshold: RSI < {oversold_threshold}\n"
-                if data_timestamp:
-                    header += f"Data as of: {data_timestamp.strftime('%Y-%m-%d %H:%M UTC')}\n"
-                header += "\n"
-                
-                lines = []
-                for i, (ticker, (rsi_val, result)) in enumerate(sorted_oversold, 1):
-                    instrument = bot.catalog.get_instrument(ticker)
-                    name = instrument.name if instrument else ticker
-                    url = instrument.tradingview_url if instrument else ""
-                    if url:
-                        line = f"{i}) **{ticker}** — [{name}](<{url}>) — RSI14: **{rsi_val:.1f}**"
-                    else:
-                        line = f"{i}) **{ticker}** — {name} — RSI14: **{rsi_val:.1f}**"
-                    lines.append(line)
-                
-                content = header + "\n".join(lines)
-                for msg in chunk_message(content, max_length=DISCORD_SAFE_LIMIT):
-                    await oversold_ch.send(msg, suppress_embeds=True)
-                    messages_sent += 1
-            else:
-                await oversold_ch.send(
-                    f"📉 **RSI Auto-Scan: Oversold** (Manual Run)\n\n"
-                    f"No stocks currently meeting oversold criteria (RSI < {oversold_threshold}).",
-                    suppress_embeds=True
-                )
-                messages_sent += 1
-        except discord.Forbidden:
-            send_errors.append(f"Cannot send to {oversold_ch.mention} - missing permissions")
-        except Exception as e:
-            send_errors.append(f"Error sending to {oversold_ch.mention}: {str(e)}")
+    guild_result = summary.get('guilds', {}).get(interaction.guild_id, {})
+    sub_alerts = guild_result.get('sub_alerts_under', 0) + guild_result.get('sub_alerts_over', 0)
+    lines = [
+        "✅ **Manual RSI Scan Complete**",
+        f"• **Provider:** {provider.name}",
+        f"• **Duration:** {summary.get('duration_seconds', 0):.1f}s",
+        f"• **Tickers:** {summary.get('tickers_ok', 0)} OK, "
+        f"{summary.get('tickers_failed', 0)} failed (of {summary.get('tickers_total', 0)})",
+        f"• **RSI values persisted:** {summary.get('persisted', 0)}",
+        f"• **Oversold:** {guild_result.get('oversold_total', 0)} tickers → {oversold_ch.mention}",
+        f"• **Overbought:** {guild_result.get('overbought_total', 0)} tickers → {overbought_ch.mention}",
+        f"• **Subscription alerts:** {sub_alerts}",
+        f"• **Messages sent:** {guild_result.get('messages_sent', 0)}",
+        f"• Summary logged to: `#{CHANGELOG_CHANNEL_NAME}`",
+    ]
 
-    # Post overbought results
-    if overbought_ch:
-        try:
-            if overbought_tickers:
-                # Sort by RSI descending
-                sorted_overbought = sorted(overbought_tickers.items(), key=lambda x: -x[1][0])
-                header = f"📈 **RSI Auto-Scan: Overbought** (Manual Run)\n"
-                header += f"Threshold: RSI > {overbought_threshold}\n"
-                if data_timestamp:
-                    header += f"Data as of: {data_timestamp.strftime('%Y-%m-%d %H:%M UTC')}\n"
-                header += "\n"
-                
-                lines = []
-                for i, (ticker, (rsi_val, result)) in enumerate(sorted_overbought, 1):
-                    instrument = bot.catalog.get_instrument(ticker)
-                    name = instrument.name if instrument else ticker
-                    url = instrument.tradingview_url if instrument else ""
-                    if url:
-                        line = f"{i}) **{ticker}** — [{name}](<{url}>) — RSI14: **{rsi_val:.1f}**"
-                    else:
-                        line = f"{i}) **{ticker}** — {name} — RSI14: **{rsi_val:.1f}**"
-                    lines.append(line)
-                
-                content = header + "\n".join(lines)
-                for msg in chunk_message(content, max_length=DISCORD_SAFE_LIMIT):
-                    await overbought_ch.send(msg, suppress_embeds=True)
-                    messages_sent += 1
-            else:
-                await overbought_ch.send(
-                    f"📈 **RSI Auto-Scan: Overbought** (Manual Run)\n\n"
-                    f"No stocks currently meeting overbought criteria (RSI > {overbought_threshold}).",
-                    suppress_embeds=True
-                )
-                messages_sent += 1
-        except discord.Forbidden:
-            send_errors.append(f"Cannot send to {overbought_ch.mention} - missing permissions")
-        except Exception as e:
-            send_errors.append(f"Error sending to {overbought_ch.mention}: {str(e)}")
+    failed = summary.get('failed_tickers') or []
+    if failed:
+        preview = ", ".join(failed[:10])
+        more = f" (+{len(failed) - 10} more)" if len(failed) > 10 else ""
+        lines.append(f"\n⚠️ **Failed tickers:** {preview}{more}")
 
-    # Step 6: Evaluate user subscriptions
-    subs = await bot.db.get_subscriptions_by_guild(guild_id=interaction.guild_id, enabled_only=True)
-    subscription_alerts = {'UNDER': [], 'OVER': []}
-    
-    if subs:
-        alerts_by_condition = await bot.alert_engine.evaluate_subscriptions(rsi_results, dry_run=False)
-        
-        # Filter to this guild only
-        for alert in alerts_by_condition.get('UNDER', []):
-            if alert.guild_id == interaction.guild_id:
-                subscription_alerts['UNDER'].append(alert)
-        for alert in alerts_by_condition.get('OVER', []):
-            if alert.guild_id == interaction.guild_id:
-                subscription_alerts['OVER'].append(alert)
-        
-        # Post subscription alerts separately if any triggered
-        if subscription_alerts['UNDER'] and oversold_ch:
-            try:
-                messages = format_alert_list(subscription_alerts['UNDER'], 'UNDER')
-                for msg in messages:
-                    await oversold_ch.send(
-                        f"🔔 **Subscription Alerts** (triggered by /run-now)\n{msg}",
-                        suppress_embeds=True
-                    )
-                    messages_sent += 1
-            except Exception as e:
-                send_errors.append(f"Subscription alerts error (oversold): {str(e)}")
-        
-        if subscription_alerts['OVER'] and overbought_ch:
-            try:
-                messages = format_alert_list(subscription_alerts['OVER'], 'OVER')
-                for msg in messages:
-                    await overbought_ch.send(
-                        f"🔔 **Subscription Alerts** (triggered by /run-now)\n{msg}",
-                        suppress_embeds=True
-                    )
-                    messages_sent += 1
-            except Exception as e:
-                send_errors.append(f"Subscription alerts error (overbought): {str(e)}")
+    issues = guild_result.get('channel_issues') or []
+    if issues:
+        lines.append("\n⚠️ **Channel issues:**")
+        lines.extend(f"• {i}" for i in issues)
 
-    # Step 7: Log to changelog
-    sub_alerts_total = len(subscription_alerts['UNDER']) + len(subscription_alerts['OVER'])
-    
-    if changelog_ch:
-        try:
-            log_msg = (
-                f"🔄 **Manual RSI Check** (`/run-now`)\n"
-                f"Triggered by: {interaction.user.mention}\n"
-                f"Time: {now.strftime('%Y-%m-%d %H:%M %Z')}\n\n"
-                f"**Scan Results:**\n"
-                f"• Provider: {provider.name}\n"
-                f"• Tickers scanned: {len(all_tickers)}\n"
-                f"• Batches: {batch_count}\n"
-                f"• Success: {successful} | Errors: {failed}\n"
-            )
-            if data_timestamp:
-                log_msg += f"• Data timestamp: {data_timestamp.strftime('%Y-%m-%d %H:%M UTC')}\n"
-            
-            log_msg += (
-                f"\n**Auto-Scan Thresholds:**\n"
-                f"• Oversold: < {oversold_threshold} ({len(oversold_tickers)} tickers)\n"
-                f"• Overbought: > {overbought_threshold} ({len(overbought_tickers)} tickers)\n"
-                f"\n**Subscription Alerts:**\n"
-                f"• Total: {sub_alerts_total}\n"
-                f"• Oversold: {len(subscription_alerts['UNDER'])}\n"
-                f"• Overbought: {len(subscription_alerts['OVER'])}\n"
-                f"\n**Messages sent:** {messages_sent}"
-            )
-            
-            if send_errors:
-                log_msg += f"\n\n⚠️ **Errors:** {len(send_errors)}"
-            
-            await changelog_ch.send(log_msg)
-        except discord.HTTPException as e:
-            logger.error(f"Failed to post to changelog: {e}")
-
-    # Step 8: Final response
-    summary = (
-        f"✅ **Manual RSI Check Complete**\n"
-        f"• **Provider:** {provider.name}\n"
-        f"• Tickers scanned: {successful} success, {failed} failed\n"
-        f"• RSI values persisted: {len(rsi_batch)}\n"
-        f"• Oversold (< {oversold_threshold}): {len(oversold_tickers)} tickers → {oversold_ch.mention if oversold_ch else 'N/A'}\n"
-        f"• Overbought (> {overbought_threshold}): {len(overbought_tickers)} tickers → {overbought_ch.mention if overbought_ch else 'N/A'}\n"
-        f"• Subscription alerts triggered: {sub_alerts_total}\n"
-        f"• Messages sent: {messages_sent}\n"
-        f"• Summary logged to: `#{CHANGELOG_CHANNEL_NAME}`"
-    )
-    
-    if send_errors:
-        summary += "\n\n⚠️ **Errors:**\n" + "\n".join(f"• {e}" for e in send_errors)
-
-    await interaction.edit_original_response(content=summary)
+    await interaction.edit_original_response(content="\n".join(lines))
 
 
 @bot.tree.command(name="set-defaults", description="Set server defaults (Admin)")
+@app_commands.guild_only()
 @app_commands.default_permissions(manage_guild=True)
 @app_commands.describe(
     default_period="Default RSI period (must be 14)",
@@ -936,6 +840,13 @@ async def set_defaults(
     """Set server-level default configuration including auto-scan thresholds and schedule toggle."""
     await interaction.response.defer(ephemeral=True)
 
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.followup.send(
+            "❌ **Permission Denied**\nThis command requires the Manage Server permission.",
+            ephemeral=True
+        )
+        return
+
     # Validate inputs
     if default_period is not None and default_period != 14:
         await interaction.followup.send("❌ Only RSI14 (period=14) is supported in this TradingView-only build", ephemeral=True)
@@ -946,23 +857,22 @@ async def set_defaults(
         return
 
     if schedule_time is not None:
-        try:
-            parts = schedule_time.split(":")
-            hour, minute = int(parts[0]), int(parts[1])
-            if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                raise ValueError()
-        except (ValueError, IndexError):
-            await interaction.followup.send("❌ Schedule time must be in HH:MM format (e.g., 18:30)", ephemeral=True)
+        schedule_time = schedule_time.strip()
+        if not SCHEDULE_TIME_PATTERN.match(schedule_time):
+            await interaction.followup.send(
+                "❌ Schedule time must be in HH:MM format, 00:00-23:59 (e.g., 18:30)",
+                ephemeral=True
+            )
             return
 
     if hysteresis is not None and hysteresis < 0:
         await interaction.followup.send("❌ Hysteresis must be non-negative", ephemeral=True)
         return
-    
+
     if auto_oversold is not None and not 0 <= auto_oversold <= 100:
         await interaction.followup.send("❌ Auto-oversold threshold must be between 0 and 100", ephemeral=True)
         return
-    
+
     if auto_overbought is not None and not 0 <= auto_overbought <= 100:
         await interaction.followup.send("❌ Auto-overbought threshold must be between 0 and 100", ephemeral=True)
         return
@@ -970,6 +880,19 @@ async def set_defaults(
     # Get old config for change detection
     old_config = await bot.db.get_or_create_guild_config(interaction.guild_id)
     old_schedule_enabled = old_config.schedule_enabled
+    old_schedule_time = old_config.default_schedule_time
+
+    # Cross-validate the *effective* threshold pair (mixing a new value with
+    # an existing one must not produce an impossible oversold >= overbought)
+    effective_oversold = auto_oversold if auto_oversold is not None else old_config.auto_oversold_threshold
+    effective_overbought = auto_overbought if auto_overbought is not None else old_config.auto_overbought_threshold
+    if effective_oversold >= effective_overbought:
+        await interaction.followup.send(
+            f"❌ Auto-oversold threshold ({effective_oversold}) must be less than "
+            f"auto-overbought threshold ({effective_overbought})",
+            ephemeral=True
+        )
+        return
 
     # Convert schedule_enabled choice to bool
     schedule_enabled_bool = None
@@ -989,10 +912,29 @@ async def set_defaults(
         schedule_enabled=schedule_enabled_bool
     )
 
+    # Apply a changed daily time to the running scheduler immediately
+    next_daily_run = None
+    schedule_time_changed = (
+        schedule_time is not None and schedule_time != old_schedule_time
+    )
+    if schedule_time_changed and bot.scheduler:
+        try:
+            next_daily_run = bot.scheduler.reschedule_guild_daily(
+                interaction.guild_id, config.default_schedule_time
+            )
+            logger.info(
+                f"Rescheduled daily check for guild {interaction.guild_id} "
+                f"to {config.default_schedule_time} (next run: {next_daily_run})"
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to reschedule daily job for guild {interaction.guild_id}"
+            )
+
     # Log schedule toggle change
     schedule_status = "✅ Enabled" if config.schedule_enabled else "❌ Disabled"
     schedule_changed = old_schedule_enabled != config.schedule_enabled
-    
+
     if schedule_changed:
         logger.info(
             f"Schedule {'enabled' if config.schedule_enabled else 'disabled'} "
@@ -1029,7 +971,16 @@ async def set_defaults(
     
     if schedule_changed:
         response += " *(changed)*"
-    
+
+    if schedule_time_changed:
+        if next_daily_run is not None:
+            response += (
+                f"\n• **Daily check rescheduled:** next run "
+                f"{next_daily_run.strftime('%Y-%m-%d %H:%M %Z')}"
+            )
+        else:
+            response += "\n• **Daily check time updated** (applies on next scheduler sync)"
+
     response += (
         f"\n\n**Fixed alert channels:**\n"
         f"• Oversold (UNDER): `#{OVERSOLD_CHANNEL_NAME}`\n"
@@ -1042,6 +993,7 @@ async def set_defaults(
 # ==================== FIXED: /ticker-info with RSI persistence (Spec Section 4.2) ====================
 
 @bot.tree.command(name="ticker-info", description="Get information about a ticker")
+@app_commands.guild_only()
 @app_commands.describe(ticker="Stock ticker symbol to look up")
 async def ticker_info(interaction: discord.Interaction, ticker: str):
     """
@@ -1174,6 +1126,7 @@ async def ticker_info(interaction: discord.Interaction, ticker: str):
 
 
 @bot.tree.command(name="catalog-stats", description="Show ticker catalog and subscription statistics")
+@app_commands.guild_only()
 async def catalog_stats(interaction: discord.Interaction):
     """Show statistics about the ticker catalog and subscriptions."""
     await interaction.response.defer(ephemeral=True)
@@ -1215,17 +1168,125 @@ async def catalog_stats(interaction: discord.Interaction):
         f"• Time: {config.default_schedule_time} (Europe/Oslo)\n\n"
         f"**Alert Channels:**\n"
         f"• `#{OVERSOLD_CHANNEL_NAME}` — UNDER alerts\n"
-        f"• `#{OVERBOUGHT_CHANNEL_NAME}` — OVER alerts",
+        f"• `#{OVERBOUGHT_CHANNEL_NAME}` — OVER alerts\n\n"
+        f"💡 Admins: use `/scheduler-status` for scheduling health details.",
         ephemeral=True
     )
 
 
+@bot.tree.command(name="scheduler-status", description="Show scheduling health: jobs, next runs, last scan (Admin)")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def scheduler_status(interaction: discord.Interaction):
+    """
+    Inspect scheduler health for this server:
+    schedule toggle, configured daily time, registered jobs with next run
+    times, latest completed scan, latest error, and channel health.
+    """
+    await interaction.response.defer(ephemeral=True)
+
+    if not interaction.user.guild_permissions.manage_guild:
+        await interaction.followup.send(
+            "❌ **Permission Denied**\nThis command requires the Manage Server permission.",
+            ephemeral=True
+        )
+        return
+
+    config = await bot.db.get_or_create_guild_config(interaction.guild_id)
+    tz = pytz.timezone(DEFAULT_TIMEZONE)
+
+    lines = ["🩺 **Scheduler Status**\n"]
+
+    # Per-guild configuration
+    lines.append("**This Server:**")
+    lines.append(f"• Schedule: {'✅ Enabled' if config.schedule_enabled else '❌ Disabled'}")
+    lines.append(f"• Daily check time: {config.default_schedule_time} ({DEFAULT_TIMEZONE})")
+    lines.append("")
+
+    if bot.scheduler is None:
+        lines.append("🚨 **Scheduler is NOT initialized** — scheduled scans will not run.")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+        return
+
+    status = bot.scheduler.get_status()
+
+    lines.append("**Scheduler:**")
+    lines.append(f"• Running: {'✅ Yes' if status['running'] else '🚨 NO — scans will not fire'}")
+    if status.get('scan_in_progress'):
+        lines.append("• A scan is running right now ⏳")
+    lines.append("")
+
+    lines.append("**Jobs & Next Runs:**")
+    jobs = status.get('jobs', [])
+    if not jobs:
+        lines.append("• 🚨 No jobs registered")
+    for job in jobs:
+        next_run = job.get('next_run_time')
+        if next_run:
+            next_str = next_run.astimezone(tz).strftime('%a %Y-%m-%d %H:%M %Z')
+        else:
+            next_str = "not scheduled"
+        lines.append(f"• `{job['id']}` → {next_str}")
+    lines.append("")
+
+    last_scan = status.get('last_scan')
+    lines.append("**Latest Scan:**")
+    if last_scan:
+        finished = last_scan.get('finished')
+        finished_str = finished.strftime('%Y-%m-%d %H:%M:%S %Z') if finished else "?"
+        outcome = "✅ OK" if last_scan.get('success') else f"🚨 FAILED ({last_scan.get('error')})"
+        lines.append(
+            f"• {last_scan.get('type', '?')} / {last_scan.get('region', '?')} at {finished_str} — {outcome}"
+        )
+        lines.append(
+            f"• Tickers: {last_scan.get('tickers_ok', 0)} OK, "
+            f"{last_scan.get('tickers_failed', 0)} failed | "
+            f"Duration: {last_scan.get('duration_seconds', 0):.1f}s | "
+            f"Guilds processed: {len(last_scan.get('guilds', {}))}, "
+            f"skipped (disabled): {last_scan.get('guilds_skipped_disabled', 0)}"
+        )
+    else:
+        lines.append("• No scan has completed since the bot started.")
+    lines.append("")
+
+    last_error = status.get('last_error')
+    lines.append("**Latest Error:**")
+    if last_error:
+        err_time = last_error.get('time')
+        err_time_str = err_time.strftime('%Y-%m-%d %H:%M:%S %Z') if err_time else "?"
+        lines.append(f"• {err_time_str} [{last_error.get('source', '?')}]: {last_error.get('error')}")
+    else:
+        lines.append("• None since startup 🎉")
+    lines.append("")
+
+    # Channel health for this guild
+    lines.append("**Channel Health (this server):**")
+    for name in (OVERSOLD_CHANNEL_NAME, OVERBOUGHT_CHANNEL_NAME, CHANGELOG_CHANNEL_NAME):
+        channel = discord.utils.get(interaction.guild.text_channels, name=name)
+        if not channel:
+            lines.append(f"• #{name}: 🚨 not found")
+        elif not channel.permissions_for(interaction.guild.me).send_messages:
+            lines.append(f"• #{name}: ⚠️ missing Send Messages permission")
+        else:
+            lines.append(f"• #{name}: ✅ OK")
+
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
 @bot.tree.command(name="reload-catalog", description="Reload the ticker catalog (Admin)")
+@app_commands.guild_only()
 @app_commands.default_permissions(administrator=True)
 async def reload_catalog(interaction: discord.Interaction):
     """Reload the ticker catalog from tickers.csv."""
     await interaction.response.defer(ephemeral=True)
-    
+
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.followup.send(
+            "❌ **Permission Denied**\nThis command requires Administrator permission.",
+            ephemeral=True
+        )
+        return
+
     old_count = len(bot.catalog)
     success = bot.catalog.reload()
     new_count = len(bot.catalog)

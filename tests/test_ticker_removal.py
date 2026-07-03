@@ -36,10 +36,17 @@ def temp_csv():
 
 @pytest.fixture
 def patched_tickers_file(temp_csv):
-    """Patch TICKERS_FILE to use temp file."""
+    """
+    Patch TICKERS_FILE to use the temp file AND reset the catalog singleton,
+    so removal operates on the temp copy - never the real data/tickers.csv.
+    """
+    from bot.repositories.ticker_catalog import reset_catalog
+
     with patch('bot.config.TICKERS_FILE', Path(temp_csv)):
         with patch('bot.repositories.ticker_catalog.TICKERS_FILE', Path(temp_csv)):
+            reset_catalog()  # next get_catalog() binds the patched path
             yield temp_csv
+            reset_catalog()  # subsequent tests get the real catalog back
 
 
 class TestTickerRemoval:

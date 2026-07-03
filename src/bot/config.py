@@ -95,6 +95,11 @@ US_MARKET_START_MINUTE = 30
 US_MARKET_END_HOUR = 22
 US_MARKET_END_MINUTE = 30
 
+# How long a fetched RSI value may be reused by back-to-back scans (seconds).
+# Prevents duplicate TradingView load when e.g. the 18:30 US auto-scan and an
+# 18:30 daily subscription check both need the same tickers.
+RSI_CACHE_TTL_SECONDS = 600
+
 # =============================================================================
 # Anti-spam / alert behavior
 # =============================================================================

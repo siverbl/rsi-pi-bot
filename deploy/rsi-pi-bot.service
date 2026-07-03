@@ -1,7 +1,9 @@
 [Unit]
-Description=RSI Pi Bot
+Description=RSI Pi Bot (Discord RSI monitor, TradingView-only)
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -11,13 +13,29 @@ Group=rsi-pi-bot
 WorkingDirectory=/opt/rsi-pi-bot
 EnvironmentFile=/etc/rsi-pi-bot.env
 
+# The project uses a src/ layout. Set PYTHONPATH here so imports work under
+# systemd without relying on an interactive shell or the env file.
+Environment=PYTHONPATH=/opt/rsi-pi-bot/src
+# Flush logs immediately so journalctl shows output in real time.
+Environment=PYTHONUNBUFFERED=1
+
 # If you use a virtualenv created inside /opt/rsi-pi-bot/venv
 ExecStart=/opt/rsi-pi-bot/venv/bin/python -m bot.main
 
 Restart=always
-RestartSec=5
+RestartSec=10
+TimeoutStopSec=30
 
-# Security hardening (safe defaults; relax if you need more access)
+# systemd creates these with correct ownership for the service user:
+#   /var/lib/rsi-pi-bot  (SQLite DB + tickers.csv -> set DB_PATH/TICKERS_FILE in env file)
+#   /var/log/rsi-pi-bot  (log file -> set LOG_PATH in env file)
+StateDirectory=rsi-pi-bot
+LogsDirectory=rsi-pi-bot
+
+# Security hardening (safe defaults; relax if you need more access).
+# ProtectSystem=full keeps /usr, /boot and /etc read-only while leaving
+# /opt/rsi-pi-bot writable (needed for runtime/ and data/tickers.csv when the
+# env file does not override DB_PATH/LOG_PATH/TICKERS_FILE).
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true

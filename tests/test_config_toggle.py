@@ -131,7 +131,7 @@ class TestGuildConfigUpdate:
         config = await db.update_guild_config(
             guild_id=guild_id,
             default_cooldown_hours=12,
-            schedule_time="09:00",
+            default_schedule_time="09:00",
             auto_oversold_threshold=28,
             auto_overbought_threshold=72,
             schedule_enabled=False
@@ -255,12 +255,3 @@ class TestSchedulerIntegration:
         # Scheduler should check this before running
         should_run = config.schedule_enabled
         assert should_run is False
-
-
-# Pytest configuration
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create event loop for async tests."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()

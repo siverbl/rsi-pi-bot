@@ -255,6 +255,26 @@ class Database:
 
     # ==================== Guild Config Operations ====================
 
+    def _row_to_guild_config(self, row) -> GuildConfig:
+        """Convert a guild_config row to a GuildConfig object."""
+        keys = row.keys()
+        oversold = row['auto_oversold_threshold'] if 'auto_oversold_threshold' in keys else None
+        overbought = row['auto_overbought_threshold'] if 'auto_overbought_threshold' in keys else None
+        schedule_enabled = row['schedule_enabled'] if 'schedule_enabled' in keys else 1
+
+        return GuildConfig(
+            guild_id=row['guild_id'],
+            default_channel_id=row['default_channel_id'],
+            default_rsi_period=row['default_rsi_period'],
+            default_schedule_time=row['default_schedule_time'],
+            default_cooldown_hours=row['default_cooldown_hours'],
+            alert_mode=row['alert_mode'],
+            hysteresis=row['hysteresis'],
+            auto_oversold_threshold=DEFAULT_AUTO_OVERSOLD_THRESHOLD if oversold is None else oversold,
+            auto_overbought_threshold=DEFAULT_AUTO_OVERBOUGHT_THRESHOLD if overbought is None else overbought,
+            schedule_enabled=bool(schedule_enabled),
+        )
+
     async def get_guild_config(self, guild_id: int) -> Optional[GuildConfig]:
         """Get guild configuration, returns None if not configured."""
         async with self.connect() as db:
@@ -266,24 +286,15 @@ class Database:
                 row = await cursor.fetchone()
                 if not row:
                     return None
+                return self._row_to_guild_config(row)
 
-                keys = row.keys()
-                oversold = row['auto_oversold_threshold'] if 'auto_oversold_threshold' in keys else None
-                overbought = row['auto_overbought_threshold'] if 'auto_overbought_threshold' in keys else None
-                schedule_enabled = row['schedule_enabled'] if 'schedule_enabled' in keys else 1
-
-                return GuildConfig(
-                    guild_id=row['guild_id'],
-                    default_channel_id=row['default_channel_id'],
-                    default_rsi_period=row['default_rsi_period'],
-                    default_schedule_time=row['default_schedule_time'],
-                    default_cooldown_hours=row['default_cooldown_hours'],
-                    alert_mode=row['alert_mode'],
-                    hysteresis=row['hysteresis'],
-                    auto_oversold_threshold=DEFAULT_AUTO_OVERSOLD_THRESHOLD if oversold is None else oversold,
-                    auto_overbought_threshold=DEFAULT_AUTO_OVERBOUGHT_THRESHOLD if overbought is None else overbought,
-                    schedule_enabled=bool(schedule_enabled),
-                )
+    async def get_all_guild_configs(self) -> List[GuildConfig]:
+        """Get all guild configurations (used to schedule per-guild daily jobs)."""
+        async with self.connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM guild_config") as cursor:
+                rows = await cursor.fetchall()
+                return [self._row_to_guild_config(row) for row in rows]
 
     async def get_or_create_guild_config(self, guild_id: int) -> GuildConfig:
         """Get guild config, creating default if it doesn't exist."""
@@ -532,6 +543,28 @@ class Database:
                 (guild_id, user_id)
             )
             await db.commit()
+            return cursor.rowcount
+
+    async def disable_subscriptions_for_ticker(self, ticker: str) -> int:
+        """
+        Disable all enabled subscriptions (across all guilds) for a ticker.
+
+        Used when a ticker is removed from the catalog so subscriptions do not
+        silently keep failing on every scan. Returns the number disabled.
+        """
+        now = datetime.utcnow().isoformat()
+        async with self.connect() as db:
+            cursor = await db.execute(
+                "UPDATE subscriptions SET enabled = 0, updated_at = ? "
+                "WHERE ticker = ? AND enabled = 1",
+                (now, ticker.upper())
+            )
+            await db.commit()
+            if cursor.rowcount:
+                logger.info(
+                    "Disabled %d subscription(s) for removed ticker %s",
+                    cursor.rowcount, ticker.upper()
+                )
             return cursor.rowcount
 
     async def get_user_subscriptions(self, guild_id: int, user_id: int) -> List[Subscription]:

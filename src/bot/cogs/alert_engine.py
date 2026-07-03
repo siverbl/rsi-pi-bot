@@ -46,15 +46,20 @@ class AlertEngine:
     async def evaluate_subscriptions(
         self,
         rsi_results: Dict[str, RSIResult],
-        dry_run: bool = False
+        dry_run: bool = False,
+        guild_id: Optional[int] = None
     ) -> Dict[str, List[Alert]]:
         """
-        Evaluate all enabled subscriptions against RSI data.
-        
+        Evaluate enabled subscriptions against RSI data.
+
         Args:
             rsi_results: Dict mapping ticker -> RSIResult
             dry_run: If True, don't update state or enforce cooldown
-        
+            guild_id: If set, only evaluate (and update state for) this
+                guild's subscriptions. Callers processing a single guild MUST
+                pass this, otherwise they would consume crossing/cooldown
+                state belonging to other guilds.
+
         Returns:
             Dict with keys 'UNDER' and 'OVER' mapping to lists of triggered alerts
         """
@@ -63,9 +68,10 @@ class AlertEngine:
             'OVER': []
         }
 
-        # Get all enabled subscriptions with their state
-        subscriptions_data = await self.db.get_subscriptions_with_state()
-        logger.info(f"Evaluating {len(subscriptions_data)} subscriptions")
+        # Get enabled subscriptions with their state (optionally guild-scoped)
+        subscriptions_data = await self.db.get_subscriptions_with_state(guild_id=guild_id)
+        logger.info(f"Evaluating {len(subscriptions_data)} subscriptions"
+                    + (f" for guild {guild_id}" if guild_id is not None else ""))
 
         # Group by guild to get configs
         guild_configs: Dict[int, GuildConfig] = {}

@@ -101,9 +101,12 @@ journalctl -u rsi-pi-bot.service -f --no-pager
 | `/list` | List all subscriptions (with optional ticker filter) | None |
 | `/run-now` | Manually trigger full RSI check | Manage Server |
 | `/set-defaults` | Configure server defaults (including schedule toggle) | Manage Server |
+| `/scheduler-status` | Show scheduling health: jobs, next runs, last scan/error | Manage Server |
 | `/ticker-info` | Look up a ticker (shows RSI, subscriptions) | None |
 | `/catalog-stats` | Show catalog and subscription statistics | None |
 | `/reload-catalog` | Reload tickers.csv | Administrator |
+
+All commands are server-only (they cannot be used in DMs).
 
 
 ### Command Examples
@@ -175,6 +178,8 @@ journalctl -u rsi-pi-bot.service -f --no-pager
 - Case-insensitive ticker matching
 - Atomic CSV write (temp file + replace) to prevent corruption
 - Shows removed ticker details (ticker, name, TradingView slug)
+- **Disables all subscriptions for the removed ticker** (across servers) and
+  reports the count — removal never leaves silently broken subscriptions
 - Logs removal to `#server-changelog`
 - Reloads catalog automatically after removal
 
@@ -383,7 +388,15 @@ rsi-pi-bot/
 │   ├── rsi-pi-bot.env.example
 │   └── rsi-pi-bot.service
 ├── tests/
+│   ├── conftest.py              # Fake Discord/TradingView objects
+│   ├── test_scheduler_jobs.py   # Job registration, windows, rescheduling
+│   ├── test_scan_pipeline.py    # Unified scan pipeline + change detection
+│   ├── test_alert_engine_scope.py
+│   ├── test_commands.py         # Slash-command permissions/validation
+│   ├── test_config_toggle.py
+│   ├── test_deployment.py       # systemd unit / import-path assumptions
 │   └── test_ticker_removal.py
+├── pytest.ini
 ├── requirements.txt
 └── README.md
 ```
@@ -435,18 +448,45 @@ The bot will:
 
 ## Scheduling
 
-The bot runs scheduled RSI checks based on `schedule_enabled` setting:
+The bot runs scheduled RSI checks based on the `schedule_enabled` setting:
 
 **When enabled:**
-- Hourly scans during market hours (European: 09:30-17:30, US/Canada: 15:30-22:30)
-- Daily subscription check at configured time (default 18:30 Europe/Oslo)
+- Hourly auto-scans during market hours, weekdays at `:30` Europe/Oslo:
+  - Europe: 09:30–17:30 (one cron job)
+  - US/Canada: 15:30–22:30 (one cron job)
+- A **per-server** daily subscription check at that server's configured
+  `schedule_time` (default 18:30 Europe/Oslo). Changing the time with
+  `/set-defaults schedule_time:HH:MM` reschedules the job immediately —
+  no restart needed.
 
 **When disabled:**
-- No automatic scans run
-- Manual `/run-now` still works
-- Status shown in `/catalog-stats`
+- No automatic scans run for that server (other servers are unaffected)
+- Manual `/run-now` still works (it bypasses the toggle)
+- Status shown in `/catalog-stats` and `/scheduler-status`
 
-Changes take effect immediately without restart.
+**Reliability design:**
+- Every server gets a default configuration automatically (on startup and
+  when the bot joins) — no slash command needed before auto-scans work.
+- All scans run through one shared pipeline (`/run-now` uses the same code
+  path as scheduled scans) and are serialized with a lock, so two scans never
+  fetch TradingView data or write SQLite concurrently.
+- RSI results are cached for 10 minutes, so back-to-back jobs (e.g. the 18:30
+  US scan and an 18:30 daily check) reuse data instead of re-querying.
+- Scheduled jobs wait for the Discord connection to be ready before running.
+
+### Diagnosing "no automatic messages"
+
+Use `/scheduler-status` (Manage Server) and `#server-changelog`:
+
+| Symptom | Meaning |
+|---------|---------|
+| `/scheduler-status` shows no jobs / not running | Scheduler never started — check `journalctl` for startup errors |
+| Jobs listed with next runs, but schedule shows ❌ Disabled | Scheduler runs, but this server opted out (`/set-defaults schedule_enabled:Enabled`) |
+| Next run is on a future weekday morning | You're outside market hours / on a weekend — nothing is due yet |
+| Changelog says "⏭️ No new hits" | The scan ran fine; nothing newly entered the oversold/overbought zone |
+| Changelog says "🚨 TradingView data fetch FAILED" | The scan ran but TradingView returned no data — check logs |
+| Changelog lists "⚠️ Channel Issues" | The scan ran but couldn't post to a channel (missing channel or Send Messages permission) |
+| No changelog message at all at `:30` | Bot can't post to `#server-changelog` (check it exists + permissions), or see `/scheduler-status` → Latest Error |
 
 ## Troubleshooting
 
@@ -469,8 +509,12 @@ Changes take effect immediately without restart.
 - Check logs for data fetch errors
 
 ### Scheduled scans not running
+- Run `/scheduler-status` — it shows whether the scheduler is running, every
+  job's next run time, the last completed scan, the last error, and channel
+  health (see the table under **Scheduling** above)
 - Check `/catalog-stats` for schedule status
 - Use `/set-defaults schedule_enabled:Enabled` to re-enable
+- On the Pi: `journalctl -u rsi-pi-bot.service --since today | grep -E "SCAN|scheduler"`
 
 ## Logs
 
@@ -489,18 +533,30 @@ MIT License - See LICENSE file for details.
 
 ## Run as a systemd service (Raspberry Pi / Linux)
 
-This avoids relying on `export DISCORD_TOKEN=...` in your shell (systemd does not inherit that).
+This avoids relying on `export DISCORD_TOKEN=...` or `PYTHONPATH=src` in your
+shell — systemd inherits neither. The provided unit sets
+`PYTHONPATH=/opt/rsi-pi-bot/src` itself, so imports work without any
+interactive-shell setup.
 
-### 1) Create a dedicated user and runtime directories
+### 1) Install the bot and create a dedicated user
 
 ```bash
 sudo useradd -r -m -s /usr/sbin/nologin rsi-pi-bot || true
 
-sudo mkdir -p /opt/rsi-pi-bot
-sudo mkdir -p /var/lib/rsi-pi-bot
-sudo mkdir -p /var/log/rsi-pi-bot
-sudo chown -R rsi-pi-bot:rsi-pi-bot /var/lib/rsi-pi-bot /var/log/rsi-pi-bot
+# Clone (or copy) the repo to /opt/rsi-pi-bot and create the venv
+sudo git clone https://github.com/<YOUR_USER_OR_ORG>/rsi-pi-bot.git /opt/rsi-pi-bot
+cd /opt/rsi-pi-bot
+sudo python3 -m venv venv
+sudo ./venv/bin/pip install -r requirements.txt
+
+# The service user must be able to write runtime/ (DB+log fallback paths)
+# and data/ (the #request channel appends to tickers.csv)
+sudo chown -R rsi-pi-bot:rsi-pi-bot /opt/rsi-pi-bot
 ```
+
+You do NOT need to create `/var/lib/rsi-pi-bot` or `/var/log/rsi-pi-bot`
+manually — the unit's `StateDirectory=`/`LogsDirectory=` make systemd create
+them with the correct ownership.
 
 ### 2) Copy the provided templates
 
@@ -512,9 +568,16 @@ Templates are included in `deploy/`:
 Copy and edit them:
 
 ```bash
-# Environment file
+# Environment file (set DISCORD_TOKEN; keep it private)
 sudo cp deploy/rsi-pi-bot.env.example /etc/rsi-pi-bot.env
+sudo chmod 600 /etc/rsi-pi-bot.env
 sudo nano /etc/rsi-pi-bot.env
+
+# If you keep tickers.csv outside the repo (recommended, the env example
+# points TICKERS_FILE at /var/lib/rsi-pi-bot), copy your file there after
+# the first start, e.g.:
+#   sudo cp data/tickers.csv /var/lib/rsi-pi-bot/tickers.csv
+#   sudo chown rsi-pi-bot:rsi-pi-bot /var/lib/rsi-pi-bot/tickers.csv
 
 # Service file
 sudo cp deploy/rsi-pi-bot.service /etc/systemd/system/rsi-pi-bot.service
@@ -525,12 +588,51 @@ sudo cp deploy/rsi-pi-bot.service /etc/systemd/system/rsi-pi-bot.service
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now rsi-pi-bot.service
+```
 
-# Follow logs
+### 4) Operate
+
+```bash
+# Reload unit definition after editing the .service file
+sudo systemctl daemon-reload
+
+# Restart the bot (e.g. after a git pull)
+sudo systemctl restart rsi-pi-bot.service
+
+# Status (is it running? recent log lines)
+systemctl status rsi-pi-bot.service --no-pager
+
+# Follow logs live
 journalctl -u rsi-pi-bot.service -f --no-pager
+
+# Logs since the last boot / today
+journalctl -u rsi-pi-bot.service -b --no-pager
+journalctl -u rsi-pi-bot.service --since today --no-pager
+```
+
+On startup you should see log lines like:
+
+```
+Starting RSI scheduler (timezone: Europe/Oslo)
+Registered auto-scan jobs: Europe 9:30-17:30, US/Canada 15:30-22:30 (Europe/Oslo, weekdays)
+Scheduler has 3 registered jobs:
+  - europe_autoscan: next run at 2026-07-06 09:30:00+02:00
+  ...
+Synced daily subscription jobs for 1 guilds
 ```
 
 ### Notes
 
 - The code supports overriding paths via environment variables: `TICKERS_FILE`, `DB_PATH`, `LOG_PATH`.
 - If you keep `tickers.csv` outside the repo (recommended), set `TICKERS_FILE=/var/lib/rsi-pi-bot/tickers.csv` and copy your existing file there.
+- The unit uses `ProtectSystem=full` (keeps `/usr`, `/boot`, `/etc` read-only) while `/opt/rsi-pi-bot` stays writable for `runtime/` and `data/tickers.csv`.
+
+## Running the tests
+
+The test suite uses temporary SQLite databases and fake Discord/TradingView
+objects — no token or network access required.
+
+```bash
+pip install pytest pytest-asyncio
+pytest
+```

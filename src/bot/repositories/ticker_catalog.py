@@ -40,8 +40,11 @@ class TickerCatalog:
     ticker,name,tradingview_slug
     """
     
-    def __init__(self, csv_path: Path = TICKERS_FILE):
-        self.csv_path = csv_path
+    def __init__(self, csv_path: Optional[Path] = None):
+        # Resolve at call time (not def time) so tests can patch
+        # bot.repositories.ticker_catalog.TICKERS_FILE before construction.
+        import bot.repositories.ticker_catalog as _self_module
+        self.csv_path = Path(csv_path) if csv_path is not None else _self_module.TICKERS_FILE
         self._instruments: Dict[str, Instrument] = {}
         self._loaded = False
 
@@ -178,6 +181,12 @@ def get_catalog() -> TickerCatalog:
         _catalog = TickerCatalog()
         _catalog.load()
     return _catalog
+
+
+def reset_catalog() -> None:
+    """Reset the global catalog singleton (primarily for tests)."""
+    global _catalog
+    _catalog = None
 
 
 def validate_ticker(ticker: str) -> tuple[bool, str]:
